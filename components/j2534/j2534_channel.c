@@ -201,8 +201,16 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
     ch->loopback = (flags & 0x01) ? true : false;
     ch->filter_count = 0;
     ch->funct_msg_count = 0;
-    ch->iso15765_bs = 0;
-    ch->iso15765_stmin = 0;
+    
+    // ISO15765 flow control parameters - RX side (what we send in FC frames)
+    ch->iso15765_bs = 0;       // Block size: 0 = no limit (receive all CFs without FC)
+    ch->iso15765_stmin = 0;    // STmin: 0 = no delay required
+    
+    // ISO15765 flow control parameters - TX side (override ECU's FC values)
+    ch->iso15765_bs_tx = 0;    // 0 = use ECU's block size from FC
+    ch->iso15765_stmin_tx = 0; // 0 = use ECU's STmin from FC
+    ch->iso15765_wft_max = 0;  // 0 = unlimited wait frames
+    
     ch->iso15765_ext_addr = false;
     ch->iso15765_ext_addr_byte = 0;
     

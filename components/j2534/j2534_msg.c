@@ -331,6 +331,46 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
 
         // Track last TX ID for functional addressing
         j2534_last_tx_id = can_frame.identifier;
+        
+        // Auto-populate functional lookup table for OBD-II functional addressing
+        // When sending to 0x7DF (11-bit) or 0x18DB33F1 (29-bit), auto-add expected response IDs
+        if (ch->funct_msg_count == 0) {
+            bool is_functional_request = false;
+            
+            // Check for standard OBD-II functional addresses
+            if (can_frame.identifier == 0x7DF && !can_frame.extd) {
+                is_functional_request = true;
+            } else if (can_frame.identifier == 0x18DB33F1 && can_frame.extd) {
+                is_functional_request = true;
+            }
+            
+            if (is_functional_request) {
+                ESP_LOGI(TAG, "Functional request detected (0x%lX), auto-populating response IDs",
+                         can_frame.identifier);
+                
+                // Add standard OBD-II response IDs (0x7E8-0x7EF for ECU #1-8)
+                for (uint32_t ecuid = 0x7E8; ecuid <= 0x7EF; ecuid++) {
+                    bool found = false;
+                    for (uint32_t j = 0; j < J2534_MAX_FUNCT_MSG_IDS; j++) {
+                        if (ch->funct_msg_table[j].active && ch->funct_msg_table[j].can_id == ecuid) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && ch->funct_msg_count < J2534_MAX_FUNCT_MSG_IDS) {
+                        for (uint32_t j = 0; j < J2534_MAX_FUNCT_MSG_IDS; j++) {
+                            if (!ch->funct_msg_table[j].active) {
+                                ch->funct_msg_table[j].can_id = ecuid;
+                                ch->funct_msg_table[j].active = true;
+                                ch->funct_msg_count++;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ESP_LOGI(TAG, "Auto-added %lu functional response IDs", ch->funct_msg_count);
+            }
+        }
 
         // Handle extended ID
         if (msgs[i].tx_flags & J2534_CAN_29BIT_ID) {

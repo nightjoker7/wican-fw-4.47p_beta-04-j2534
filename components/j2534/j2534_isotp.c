@@ -534,6 +534,7 @@ j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id,
     TickType_t fc_timeout = pdMS_TO_TICKS(timeout > 0 ? timeout : 1000);
     uint8_t fc_stmin = ch->iso15765_stmin;
     uint8_t fc_bs = 0;
+    uint8_t wft_count = 0;  // Wait Frame counter for WFT_MAX
     
     ESP_LOGI(TAG, "ISO15765: Waiting for FC from ECU...");
     
@@ -549,7 +550,17 @@ j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id,
     if (isotp_fc_state.fc_received) {
         // Handle FC Wait status (FS=1)
         while (isotp_fc_state.fc_flow_status == 1) {
-            ESP_LOGI(TAG, "ISO15765: FC Wait received, waiting for CTS...");
+            wft_count++;
+            
+            // Check WFT_MAX limit
+            if (ch->iso15765_wft_max > 0 && wft_count > ch->iso15765_wft_max) {
+                ESP_LOGE(TAG, "ISO15765: WFT_MAX (%u) exceeded, aborting", ch->iso15765_wft_max);
+                isotp_fc_state.waiting_for_fc = false;
+                return J2534_ERR_TIMEOUT;
+            }
+            
+            ESP_LOGI(TAG, "ISO15765: FC Wait received (%u/%u), waiting for CTS...", 
+                     wft_count, ch->iso15765_wft_max);
             isotp_fc_state.fc_received = false;
             
             TickType_t wait_start = xTaskGetTickCount();
@@ -569,9 +580,21 @@ j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id,
             return J2534_ERR_BUFFER_OVERFLOW;
         }
         
+        // Get timing from FC response
         fc_stmin = isotp_fc_state.fc_stmin;
         fc_bs = isotp_fc_state.fc_block_size;
-        ESP_LOGI(TAG, "ISO15765: FC received, BS=%d STmin=%d", fc_bs, fc_stmin);
+        
+        // Apply TX overrides if configured (BS_TX/STMIN_TX)
+        if (ch->iso15765_stmin_tx > 0) {
+            ESP_LOGI(TAG, "ISO15765: Overriding STmin %u -> %u (STMIN_TX)", fc_stmin, ch->iso15765_stmin_tx);
+            fc_stmin = ch->iso15765_stmin_tx;
+        }
+        if (ch->iso15765_bs_tx > 0) {
+            ESP_LOGI(TAG, "ISO15765: Overriding BS %u -> %u (BS_TX)", fc_bs, ch->iso15765_bs_tx);
+            fc_bs = ch->iso15765_bs_tx;
+        }
+        
+        ESP_LOGI(TAG, "ISO15765: FC received, BS=%d STmin=%d (after overrides)", fc_bs, fc_stmin);
     }
     
     isotp_fc_state.waiting_for_fc = false;
@@ -600,7 +623,17 @@ j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id,
             
             if (isotp_fc_state.fc_received) {
                 while (isotp_fc_state.fc_flow_status == 1) {
-                    ESP_LOGI(TAG, "ISO15765: FC Wait in block, waiting for CTS...");
+                    wft_count++;
+                    
+                    // Check WFT_MAX limit
+                    if (ch->iso15765_wft_max > 0 && wft_count > ch->iso15765_wft_max) {
+                        ESP_LOGE(TAG, "ISO15765: WFT_MAX (%u) exceeded in block, aborting", ch->iso15765_wft_max);
+                        isotp_fc_state.waiting_for_fc = false;
+                        return J2534_ERR_TIMEOUT;
+                    }
+                    
+                    ESP_LOGI(TAG, "ISO15765: FC Wait in block (%u/%u), waiting for CTS...",
+                             wft_count, ch->iso15765_wft_max);
                     isotp_fc_state.fc_received = false;
                     
                     TickType_t wait_start = xTaskGetTickCount();
@@ -621,7 +654,13 @@ j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id,
                 }
                 
                 fc_stmin = isotp_fc_state.fc_stmin;
-                ESP_LOGI(TAG, "ISO15765: Block FC received, new STmin=%d", fc_stmin);
+                
+                // Apply TX override if configured
+                if (ch->iso15765_stmin_tx > 0) {
+                    fc_stmin = ch->iso15765_stmin_tx;
+                }
+                
+                ESP_LOGI(TAG, "ISO15765: Block FC received, STmin=%d", fc_stmin);
             }
             
             isotp_fc_state.waiting_for_fc = false;

@@ -290,9 +290,13 @@ typedef struct {
     // Functional message lookup table (for broadcast addressing)
     j2534_funct_msg_entry_t funct_msg_table[J2534_MAX_FUNCT_MSG_IDS];
     uint32_t funct_msg_count;                // Active functional msg count
-    // ISO15765 specific
-    uint8_t iso15765_bs;                     // Block size
-    uint8_t iso15765_stmin;                  // Separation time min
+    // ISO15765 specific - RX side (used in FC frames we send)
+    uint8_t iso15765_bs;                     // Block size for FC frames we send
+    uint8_t iso15765_stmin;                  // STmin for FC frames we send
+    // ISO15765 specific - TX side (override ECU's FC values)
+    uint8_t iso15765_bs_tx;                  // TX block size (0 = use ECU's value)
+    uint8_t iso15765_stmin_tx;               // TX STmin (0 = use ECU's value)
+    uint8_t iso15765_wft_max;                // Max wait frames before timeout (0 = unlimited)
     bool iso15765_ext_addr;                  // Extended addressing mode (first byte = address)
     uint8_t iso15765_ext_addr_byte;          // Extended address byte when in ext mode
     // Timing parameters

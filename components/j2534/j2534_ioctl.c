@@ -61,6 +61,15 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
                         case J2534_CONFIG_ISO15765_STMIN:
                             list->config_ptr[i].value = ch->iso15765_stmin;
                             break;
+                        case J2534_CONFIG_ISO15765_BS_TX:
+                            list->config_ptr[i].value = ch->iso15765_bs_tx;
+                            break;
+                        case J2534_CONFIG_ISO15765_STMIN_TX:
+                            list->config_ptr[i].value = ch->iso15765_stmin_tx;
+                            break;
+                        case J2534_CONFIG_ISO15765_WFT_MAX:
+                            list->config_ptr[i].value = ch->iso15765_wft_max;
+                            break;
                         // KWP2000/ISO9141 timing parameters
                         case J2534_CONFIG_P1_MIN:
                             list->config_ptr[i].value = ch->p1_min;
@@ -120,9 +129,23 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
                             break;
                         case J2534_CONFIG_ISO15765_BS:
                             ch->iso15765_bs = list->config_ptr[i].value;
+                            ESP_LOGI(TAG, "SET_CONFIG: ISO15765_BS=%u", ch->iso15765_bs);
                             break;
                         case J2534_CONFIG_ISO15765_STMIN:
                             ch->iso15765_stmin = list->config_ptr[i].value;
+                            ESP_LOGI(TAG, "SET_CONFIG: ISO15765_STMIN=%u", ch->iso15765_stmin);
+                            break;
+                        case J2534_CONFIG_ISO15765_BS_TX:
+                            ch->iso15765_bs_tx = list->config_ptr[i].value;
+                            ESP_LOGI(TAG, "SET_CONFIG: ISO15765_BS_TX=%u (0=use ECU value)", ch->iso15765_bs_tx);
+                            break;
+                        case J2534_CONFIG_ISO15765_STMIN_TX:
+                            ch->iso15765_stmin_tx = list->config_ptr[i].value;
+                            ESP_LOGI(TAG, "SET_CONFIG: ISO15765_STMIN_TX=%u (0=use ECU value)", ch->iso15765_stmin_tx);
+                            break;
+                        case J2534_CONFIG_ISO15765_WFT_MAX:
+                            ch->iso15765_wft_max = list->config_ptr[i].value;
+                            ESP_LOGI(TAG, "SET_CONFIG: ISO15765_WFT_MAX=%u (0=unlimited)", ch->iso15765_wft_max);
                             break;
                         // KWP2000/ISO9141 timing parameters
                         case J2534_CONFIG_P1_MIN:
