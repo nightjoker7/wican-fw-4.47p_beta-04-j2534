@@ -105,6 +105,26 @@ static protocol_type_t get_protocol_type(uint32_t protocol_id, uint32_t *mapped_
  * Data Structures
  * ============================================================================ */
 
+/* ============================================================================
+ * Write Buffer for Consecutive Frame Batching
+ * 
+ * ECU reprogramming sends ISO-TP consecutive frames as individual raw CAN
+ * messages. Each PassThruWriteMsgs call normally triggers a TCP round-trip
+ * (~10-50ms), but the ECU expects frames at CAN speed (~1ms gaps).
+ * 
+ * This buffer accumulates rapid writes and sends them as a single batch,
+ * eliminating per-frame TCP latency.
+ * ============================================================================ */
+#define WRITE_BUFFER_SIZE       64      /* Max frames to buffer */
+#define WRITE_BUFFER_TIMEOUT_MS 2       /* Flush after this idle time */
+
+typedef struct {
+    wican_can_msg_t msgs[WRITE_BUFFER_SIZE];
+    uint32_t count;
+    DWORD last_write_time;              /* Tick count of last write */
+    uint32_t timeout;                   /* Timeout for batch send */
+} write_buffer_t;
+
 typedef struct {
     bool in_use;
     uint32_t channel_id;
@@ -115,6 +135,7 @@ typedef struct {
     bool connected;
     uint32_t fw_channel_id;  /* Channel ID from firmware */
     uint32_t loopback;       /* Loopback enabled */
+    write_buffer_t write_buf; /* Write buffer for batching */
 } j2534_channel_t;
 
 typedef struct {
@@ -199,6 +220,50 @@ static j2534_channel_t* get_channel(unsigned long channel_id, j2534_device_t **o
         }
     }
     return NULL;
+}
+
+/**
+ * Flush the write buffer for a channel
+ * 
+ * Sends all buffered messages as a batch to minimize TCP round-trips.
+ * This is critical for ECU reprogramming where consecutive frames must
+ * be sent rapidly.
+ * 
+ * @param device Device containing the channel
+ * @param channel Channel with buffer to flush
+ * @param num_sent Output: number of messages actually sent
+ * @return true on success, false on error
+ */
+static bool flush_write_buffer(j2534_device_t *device, j2534_channel_t *channel, uint32_t *num_sent)
+{
+    write_buffer_t *buf = &channel->write_buf;
+    
+    if (buf->count == 0) {
+        if (num_sent) *num_sent = 0;
+        return true;
+    }
+    
+    char dbg[128];
+    sprintf(dbg, "[J2534] flush_write_buffer: Flushing %lu buffered frames via batch\n", buf->count);
+    OutputDebugStringA(dbg);
+    
+    uint32_t sent = 0;
+    bool result;
+    
+    if (buf->count == 1) {
+        /* Single message - use normal send */
+        result = wican_write_messages(&device->wican_ctx, channel->fw_channel_id,
+                                      channel->protocol_id, buf->msgs, 1, buf->timeout, &sent);
+    } else {
+        /* Multiple messages - use batch send */
+        result = wican_write_messages_batch(&device->wican_ctx, channel->fw_channel_id,
+                                            buf->msgs, buf->count, buf->timeout, &sent);
+    }
+    
+    if (num_sent) *num_sent = sent;
+    buf->count = 0;
+    
+    return result;
 }
 
 static j2534_device_t* allocate_device(void)
@@ -531,6 +596,26 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
         return ERR_DEVICE_NOT_CONNECTED;
     }
     
+    /**
+     * Flush any pending write buffer before reading
+     * 
+     * This is critical for ECU reprogramming: the application sends consecutive
+     * frames (which we buffer), then reads the response. We must ensure all
+     * buffered frames are sent before we try to read the ECU's response.
+     */
+    if (channel->write_buf.count > 0) {
+        char dbg[128];
+        sprintf(dbg, "[J2534] PassThruReadMsgs: Flushing %lu buffered writes before read\n",
+                channel->write_buf.count);
+        OutputDebugStringA(dbg);
+        
+        uint32_t flushed = 0;
+        if (!flush_write_buffer(device, channel, &flushed)) {
+            /* Log error but continue with read attempt */
+            OutputDebugStringA("[J2534] WARNING: Write buffer flush failed before read\n");
+        }
+    }
+    
     uint32_t max_msgs = (*pNumMsgs > 32) ? 32 : *pNumMsgs;
     
     if (!wican_read_messages(&device->wican_ctx, channel->fw_channel_id, can_msgs, 
@@ -603,6 +688,7 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     
     uint32_t num_msgs = (*pNumMsgs > 32) ? 32 : *pNumMsgs;
     
+    /* Convert PASSTHRU_MSG to internal format */
     for (uint32_t i = 0; i < num_msgs; i++) {
         memset(&can_msgs[i], 0, sizeof(wican_can_msg_t));
         
@@ -624,9 +710,89 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
         }
     }
     
+    /**
+     * Write buffering for raw CAN channels (protocol 5)
+     * 
+     * ECU reprogramming sends ISO-TP consecutive frames as individual raw CAN
+     * messages. Each message sent separately triggers a TCP round-trip (~10-50ms),
+     * but the ECU expects frames at CAN speed (~1ms gaps).
+     * 
+     * Detection of ISO-TP consecutive frames:
+     * - PCI byte (first data byte) has format 0x2N where N is sequence number
+     * - These are typically 8-byte frames
+     * 
+     * Strategy: Buffer writes and flush when:
+     * 1. Buffer is full (WRITE_BUFFER_SIZE messages)
+     * 2. A non-consecutive frame is written (likely start of new transaction)
+     * 3. Buffer timeout expires (handled by PassThruReadMsgs)
+     */
+    bool is_raw_can = (channel->protocol_id == CAN || channel->protocol_id == CAN_PS ||
+                       channel->protocol_id == SW_CAN_PS || channel->protocol_id == CAN_CH1 ||
+                       channel->protocol_id == CAN_CH2);
+    
+    /* Check if this looks like ISO-TP consecutive frames */
+    bool is_consecutive_frame = false;
+    if (is_raw_can && num_msgs == 1 && can_msgs[0].data_len == 8) {
+        uint8_t pci = can_msgs[0].data[0];
+        if ((pci & 0xF0) == 0x20) {  /* PCI type 2 = Consecutive Frame */
+            is_consecutive_frame = true;
+        }
+    }
+    
     uint32_t num_sent = 0;
-    if (!wican_write_messages(&device->wican_ctx, channel->fw_channel_id, 
-                              channel->protocol_id, can_msgs, num_msgs, Timeout, &num_sent)) {
+    bool result = true;
+    write_buffer_t *buf = &channel->write_buf;
+    
+    if (is_raw_can && is_consecutive_frame) {
+        /* Buffer consecutive frames for batch sending */
+        buf->timeout = Timeout;
+        buf->last_write_time = GetTickCount();
+        
+        /* Add messages to buffer */
+        for (uint32_t i = 0; i < num_msgs && result; i++) {
+            if (buf->count >= WRITE_BUFFER_SIZE) {
+                /* Buffer full - flush it */
+                uint32_t flushed = 0;
+                result = flush_write_buffer(device, channel, &flushed);
+                num_sent += flushed;
+            }
+            
+            if (result) {
+                memcpy(&buf->msgs[buf->count], &can_msgs[i], sizeof(wican_can_msg_t));
+                buf->count++;
+            }
+        }
+        
+        /* Consider message "sent" once buffered - actual send happens on flush */
+        if (result) {
+            num_sent = num_msgs;
+        }
+    } else {
+        /* Non-consecutive frame or non-raw-CAN: flush any pending buffer first */
+        if (buf->count > 0) {
+            uint32_t flushed = 0;
+            if (!flush_write_buffer(device, channel, &flushed)) {
+                /* Buffer flush failed - continue anyway */
+            }
+        }
+        
+        /* Send this message immediately */
+        if (num_msgs > 1 && is_raw_can) {
+            /* Multiple raw CAN frames at once - use batch mode */
+            char dbg[128];
+            sprintf(dbg, "[J2534] PassThruWriteMsgs: Using BATCH mode for %lu raw CAN frames\n", num_msgs);
+            OutputDebugStringA(dbg);
+            
+            result = wican_write_messages_batch(&device->wican_ctx, channel->fw_channel_id,
+                                                can_msgs, num_msgs, Timeout, &num_sent);
+        } else {
+            /* Single message or ISO15765 - use normal mode */
+            result = wican_write_messages(&device->wican_ctx, channel->fw_channel_id,
+                                          channel->protocol_id, can_msgs, num_msgs, Timeout, &num_sent);
+        }
+    }
+    
+    if (!result) {
         *pNumMsgs = num_sent;
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to write messages");

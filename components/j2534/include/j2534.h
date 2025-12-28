@@ -330,6 +330,7 @@ typedef enum {
     J2534_CMD_IOCTL                 = 0x0C,  // PassThruIoctl
     J2534_CMD_OPEN                  = 0x0D,  // PassThruOpen
     J2534_CMD_CLOSE                 = 0x0E,  // PassThruClose
+    J2534_CMD_WRITE_MSGS_BATCH      = 0x0F,  // PassThruWriteMsgs batch mode for raw CAN
 } j2534_cmd_t;
 
 /* ============================================================================

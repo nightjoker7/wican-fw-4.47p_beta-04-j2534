@@ -9,6 +9,7 @@
 
 #include "j2534.h"
 #include "j2534_internal.h"
+#include "can.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -387,6 +388,121 @@ void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_
             j2534_get_last_error(err_desc);
             memcpy(resp_data, err_desc, 80);
             resp_len = 80;
+            break;
+        }
+
+        case J2534_CMD_WRITE_MSGS_BATCH:
+        {
+            /**
+             * Batch write for raw CAN frames - used for ECU reprogramming
+             * 
+             * Packet format:
+             *   channel_id(4) + timeout(4) + num_msgs(4) + [msg_len(2) + msg_data(msg_len)]...
+             * 
+             * Each message is: CAN_ID(4) + data(8) = 12 bytes for raw CAN
+             * 
+             * This command queues ALL frames to the CAN TX buffer before responding,
+             * enabling high-speed consecutive frame transmission for ISO-TP.
+             */
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS_BATCH: len=%u", len);
+            if (len < 12) {
+                ESP_LOGE(TAG, "CMD_WRITE_MSGS_BATCH: len < 12");
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) |
+                             (data[2] << 8) | data[3];
+            uint32_t timeout = (data[4] << 24) | (data[5] << 16) |
+                               (data[6] << 8) | data[7];
+            uint32_t num_msgs_to_send = (data[8] << 24) | (data[9] << 16) |
+                                        (data[10] << 8) | data[11];
+            
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS_BATCH: ch=%lu timeout=%lu num=%lu", 
+                     ch_id, timeout, num_msgs_to_send);
+            
+            j2534_channel_t *ch = j2534_get_channel(ch_id);
+            if (!ch) {
+                status = J2534_ERR_INVALID_CHANNEL_ID;
+                break;
+            }
+            
+            // Switch active channel if needed
+            if (j2534_active_channel != ch_id) {
+                twai_clear_receive_queue();
+                j2534_active_channel = ch_id;
+                j2534_rx_msg_head = 0;
+                j2534_rx_msg_tail = 0;
+            }
+            
+            uint32_t sent_count = 0;
+            uint32_t offset = 12;  // Start after header
+            uint32_t send_timeout = (timeout > 0) ? timeout : 100;
+            
+            for (uint32_t i = 0; i < num_msgs_to_send && offset + 2 <= len; i++) {
+                // Read message length (2 bytes)
+                uint16_t msg_len = (data[offset] << 8) | data[offset + 1];
+                offset += 2;
+                
+                if (msg_len < 4 || offset + msg_len > len) {
+                    ESP_LOGW(TAG, "BATCH: Invalid msg len %u at offset %lu", msg_len, offset);
+                    break;
+                }
+                
+                // Parse CAN frame
+                twai_message_t can_frame;
+                memset(&can_frame, 0, sizeof(can_frame));
+                
+                can_frame.identifier = (data[offset] << 24) |
+                                       (data[offset + 1] << 16) |
+                                       (data[offset + 2] << 8) |
+                                       data[offset + 3];
+                can_frame.identifier &= 0x7FF;  // 11-bit ID
+                can_frame.extd = 0;
+                can_frame.self = 0;
+                
+                uint8_t payload_len = msg_len - 4;
+                if (payload_len > 8) payload_len = 8;
+                can_frame.data_length_code = payload_len;
+                memcpy(can_frame.data, &data[offset + 4], payload_len);
+                
+                offset += msg_len;
+                
+                // Queue the frame
+                esp_err_t send_result = can_send(&can_frame, pdMS_TO_TICKS(send_timeout));
+                if (send_result == ESP_OK) {
+                    sent_count++;
+                } else {
+                    ESP_LOGW(TAG, "BATCH: Frame %lu send failed: %d", i, send_result);
+                    break;
+                }
+            }
+            
+            // Wait for TX queue to drain (important for timing-critical operations)
+            twai_status_info_t status_info;
+            TickType_t drain_start = xTaskGetTickCount();
+            TickType_t drain_timeout = pdMS_TO_TICKS(5000);
+            
+            while (1) {
+                twai_get_status_info(&status_info);
+                if (status_info.msgs_to_tx == 0) {
+                    break;
+                }
+                if ((xTaskGetTickCount() - drain_start) >= drain_timeout) {
+                    ESP_LOGW(TAG, "BATCH: TX drain timeout, %lu msgs pending",
+                             status_info.msgs_to_tx);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS_BATCH: sent %lu/%lu msgs", sent_count, num_msgs_to_send);
+            
+            resp_data[0] = (sent_count >> 24) & 0xFF;
+            resp_data[1] = (sent_count >> 16) & 0xFF;
+            resp_data[2] = (sent_count >> 8) & 0xFF;
+            resp_data[3] = sent_count & 0xFF;
+            resp_len = 4;
             break;
         }
 

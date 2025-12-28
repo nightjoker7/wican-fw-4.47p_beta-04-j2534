@@ -58,6 +58,7 @@ extern "C" {
 #define WICAN_CMD_IOCTL             0x0C  // PassThruIoctl
 #define WICAN_CMD_OPEN              0x0D  // PassThruOpen
 #define WICAN_CMD_CLOSE             0x0E  // PassThruClose
+#define WICAN_CMD_WRITE_MSGS_BATCH  0x0F  // PassThruWriteMsgs batch mode for raw CAN
 #define WICAN_CMD_RESPONSE          0x80  // Response flag
 
 /* Response status codes (J2534 error codes) */
@@ -276,6 +277,26 @@ bool wican_read_messages(wican_context_t *ctx, uint32_t channel_id, wican_can_ms
 bool wican_write_messages(wican_context_t *ctx, uint32_t channel_id, uint32_t protocol_id,
                           const wican_can_msg_t *msgs, uint32_t num_msgs, 
                           uint32_t timeout_ms, uint32_t *num_sent);
+
+/**
+ * @brief Write multiple raw CAN messages in batch mode
+ * 
+ * This function sends multiple CAN frames in a single command packet,
+ * allowing the firmware to queue them all before transmitting. This is
+ * critical for ECU reprogramming where consecutive frames must be sent
+ * rapidly without TCP round-trip delays between each frame.
+ * 
+ * @param ctx Pointer to context structure
+ * @param channel_id Channel ID from PassThruConnect
+ * @param msgs Array of raw CAN messages (max 12 bytes each: 4-byte ID + 8-byte data)
+ * @param num_msgs Number of messages to send
+ * @param timeout_ms Timeout in milliseconds
+ * @param num_sent Pointer to receive number of messages actually sent
+ * @return true on success
+ */
+bool wican_write_messages_batch(wican_context_t *ctx, uint32_t channel_id,
+                                const wican_can_msg_t *msgs, uint32_t num_msgs, 
+                                uint32_t timeout_ms, uint32_t *num_sent);
 
 /**
  * @brief Set CAN filter

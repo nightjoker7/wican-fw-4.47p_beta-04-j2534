@@ -1165,6 +1165,145 @@ bool wican_write_messages(wican_context_t *ctx, uint32_t channel_id, uint32_t pr
     return true;
 }
 
+bool wican_write_messages_batch(wican_context_t *ctx, uint32_t channel_id,
+                                const wican_can_msg_t *msgs, uint32_t num_msgs, 
+                                uint32_t timeout_ms, uint32_t *num_sent)
+{
+    /**
+     * Batch write for raw CAN frames - critical for ECU reprogramming
+     * 
+     * Packet format:
+     *   channel_id(4) + timeout(4) + num_msgs(4) + [msg_len(2) + msg_data(msg_len)]...
+     * 
+     * Each raw CAN message is: msg_len(2) + CAN_ID(4) + data(8) = 2 + 12 bytes
+     * Max packet size is WICAN_MAX_PACKET_SIZE (4200 bytes)
+     * So max messages per batch is about (4200 - 12) / 14 = ~299 messages
+     */
+    uint8_t data[WICAN_MAX_PACKET_SIZE];
+    uint8_t resp_data[16];
+    uint16_t resp_len = sizeof(resp_data);
+    uint8_t resp_cmd, resp_status;
+    uint16_t offset = 0;
+    
+    if (!msgs || num_msgs == 0) {
+        return false;
+    }
+    
+    /* Header: channel_id(4) + timeout(4) + num_msgs(4) */
+    data[offset++] = (channel_id >> 24) & 0xFF;
+    data[offset++] = (channel_id >> 16) & 0xFF;
+    data[offset++] = (channel_id >> 8) & 0xFF;
+    data[offset++] = channel_id & 0xFF;
+    
+    data[offset++] = (timeout_ms >> 24) & 0xFF;
+    data[offset++] = (timeout_ms >> 16) & 0xFF;
+    data[offset++] = (timeout_ms >> 8) & 0xFF;
+    data[offset++] = timeout_ms & 0xFF;
+    
+    data[offset++] = (num_msgs >> 24) & 0xFF;
+    data[offset++] = (num_msgs >> 16) & 0xFF;
+    data[offset++] = (num_msgs >> 8) & 0xFF;
+    data[offset++] = num_msgs & 0xFF;
+    
+    /* Pack each message: msg_len(2) + CAN_ID(4) + data(up to 8) */
+    for (uint32_t i = 0; i < num_msgs; i++) {
+        uint16_t msg_len = 4 + msgs[i].data_len;  /* CAN ID + data */
+        if (msg_len > 12) msg_len = 12;  /* Max 4 + 8 for raw CAN */
+        
+        /* Check if we have room for this message */
+        if (offset + 2 + msg_len > WICAN_MAX_PACKET_SIZE - 10) {
+            /* Packet full, send what we have and return partial success */
+            {
+                char dbg[128];
+                sprintf(dbg, "[WICAN] write_batch: packet full at msg %lu/%lu\n", i, num_msgs);
+                OutputDebugStringA(dbg);
+                printf("%s", dbg);
+            }
+            break;
+        }
+        
+        /* Message length */
+        data[offset++] = (msg_len >> 8) & 0xFF;
+        data[offset++] = msg_len & 0xFF;
+        
+        /* CAN ID */
+        data[offset++] = (msgs[i].can_id >> 24) & 0xFF;
+        data[offset++] = (msgs[i].can_id >> 16) & 0xFF;
+        data[offset++] = (msgs[i].can_id >> 8) & 0xFF;
+        data[offset++] = msgs[i].can_id & 0xFF;
+        
+        /* Data */
+        uint8_t copy_len = msgs[i].data_len;
+        if (copy_len > 8) copy_len = 8;
+        memcpy(&data[offset], msgs[i].data, copy_len);
+        offset += copy_len;
+    }
+    
+    {
+        char dbg[256];
+        sprintf(dbg, "[WICAN] write_batch: ch=%lu msgs=%lu total_size=%u\n", 
+                channel_id, num_msgs, offset);
+        OutputDebugStringA(dbg);
+        printf("%s", dbg);
+    }
+    
+    if (!wican_send_command(ctx, WICAN_CMD_WRITE_MSGS_BATCH, data, offset)) {
+        OutputDebugStringA("[WICAN] write_batch: send_command failed\n");
+        printf("[WICAN] write_batch: send_command failed\n");
+        if (num_sent) *num_sent = 0;
+        return false;
+    }
+    
+    /* Wait for response - firmware will queue all frames first then respond */
+    uint32_t wait_timeout = timeout_ms;
+    if (wait_timeout < 6000) {
+        wait_timeout = 6000;  /* Minimum 6 seconds for large batch TX */
+    }
+    
+    if (!wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, wait_timeout)) {
+        OutputDebugStringA("[WICAN] write_batch: receive_response failed\n");
+        printf("[WICAN] write_batch: receive_response failed\n");
+        if (num_sent) *num_sent = 0;
+        return false;
+    }
+    
+    {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] write_batch: resp_cmd=0x%02X resp_status=0x%02X\n",
+                resp_cmd, resp_status);
+        OutputDebugStringA(dbg);
+        printf("%s", dbg);
+    }
+    
+    if (resp_status != WICAN_RESP_OK) {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] write_batch: bad status 0x%02X\n", resp_status);
+        OutputDebugStringA(dbg);
+        printf("%s", dbg);
+        if (num_sent) *num_sent = 0;
+        return false;
+    }
+    
+    /* Parse response: number of messages sent */
+    if (resp_len >= 4) {
+        uint32_t sent_count = ((uint32_t)resp_data[0] << 24) |
+                              ((uint32_t)resp_data[1] << 16) |
+                              ((uint32_t)resp_data[2] << 8) |
+                              resp_data[3];
+        if (num_sent) *num_sent = sent_count;
+        {
+            char dbg[128];
+            sprintf(dbg, "[WICAN] write_batch: sent %lu/%lu msgs\n", sent_count, num_msgs);
+            OutputDebugStringA(dbg);
+            printf("%s", dbg);
+        }
+    } else {
+        if (num_sent) *num_sent = num_msgs;
+    }
+    
+    return true;
+}
+
 bool wican_set_filter(wican_context_t *ctx, uint32_t channel_id, uint32_t filter_type, 
                       uint32_t mask, uint32_t pattern, uint32_t flow_control, uint32_t *filter_id)
 {
