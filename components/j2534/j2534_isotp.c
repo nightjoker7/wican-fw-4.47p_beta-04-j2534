@@ -286,23 +286,36 @@ int32_t j2534_can_to_msg(twai_message_t *frame, uint8_t *output_buf)
         uint8_t pci_offset = 0;
         uint8_t ext_addr_byte = 0;
 
-        if (ch->iso15765_ext_addr) {
+        // Extended addressing detection - be conservative to avoid false positives
+        // First check if the frame looks like standard ISO-TP (PCI type 0-3 in first byte)
+        uint8_t first_byte = frame->data[0];
+        uint8_t first_pci_type = (first_byte >> 4) & 0x0F;
+        
+        if (first_pci_type <= 0x3) {
+            // Standard ISO-TP frame detected - reset extended addressing if it was set
+            if (ch->iso15765_ext_addr) {
+                ESP_LOGI(TAG, "ISO-TP: Standard frame detected, clearing extended addressing mode");
+                ch->iso15765_ext_addr = false;
+                ch->iso15765_ext_addr_byte = 0;
+            }
+            pci_offset = 0;
+        } else if (ch->iso15765_ext_addr) {
+            // Extended addressing was explicitly configured - use it
             pci_offset = 1;
-            ext_addr_byte = frame->data[0];
+            ext_addr_byte = first_byte;
             ESP_LOGI(TAG, "ISO-TP: Using extended addressing (configured), ext_addr=0x%02X", ext_addr_byte);
         } else if (frame->data_length_code >= 2) {
-            // Auto-detect extended addressing
-            uint8_t first_byte = frame->data[0];
+            // Auto-detect extended addressing only if first byte clearly can't be PCI
+            // and second byte looks like valid PCI
             uint8_t second_byte = frame->data[1];
-            uint8_t first_pci_type = (first_byte >> 4) & 0x0F;
             uint8_t second_pci_type = (second_byte >> 4) & 0x0F;
 
             if (first_pci_type >= 0x4 && second_pci_type <= 0x3) {
+                // Looks like extended addressing - use for THIS frame only
+                // Don't persist to avoid sticky false positives
                 pci_offset = 1;
                 ext_addr_byte = first_byte;
-                ch->iso15765_ext_addr = true;
-                ch->iso15765_ext_addr_byte = ext_addr_byte;
-                ESP_LOGI(TAG, "ISO-TP: Detected extended addressing, ext_addr=0x%02X", ext_addr_byte);
+                ESP_LOGI(TAG, "ISO-TP: Extended addressing detected for this frame, ext_addr=0x%02X", ext_addr_byte);
             }
         }
 

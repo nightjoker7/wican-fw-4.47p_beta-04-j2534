@@ -393,16 +393,19 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
             bool use_padding = (msgs[i].tx_flags & J2534_ISO15765_PADDING) != 0;
 
             // Check for pre-formatted ISO-TP frames
+            // IMPORTANT: Don't persist extended addressing detection from pre-formatted
+            // frames as this can cause false positives on subsequent normal frames
             bool is_preformatted = false;
             if (payload_len == 8) {
                 uint8_t first_pci = (payload[0] >> 4) & 0x0F;
                 if (first_pci <= 0x3) {
+                    // Standard ISO-TP pre-formatted frame
                     is_preformatted = true;
                 } else if (first_pci >= 0x4 && ((payload[1] >> 4) & 0x0F) <= 0x3) {
-                    // Extended addressing
+                    // Looks like extended addressing pre-formatted frame
+                    // Don't set ch->iso15765_ext_addr to avoid sticky false positives
                     is_preformatted = true;
-                    ch->iso15765_ext_addr = true;
-                    ch->iso15765_ext_addr_byte = payload[0];
+                    ESP_LOGI(TAG, "TX: Pre-formatted frame with extended addr 0x%02X", payload[0]);
                 }
             }
 
