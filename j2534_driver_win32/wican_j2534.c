@@ -26,38 +26,78 @@
 #define MAX_PERIODIC_MSGS   16
 
 /* ============================================================================
- * Protocol ID Mapping
- * Maps J2534-2 extended protocols to base CAN/ISO15765 when applicable
+ * Protocol Type Enumeration
  * ============================================================================ */
-static uint32_t map_protocol_to_can(uint32_t protocol_id, bool *is_iso15765)
+typedef enum {
+    PROTO_TYPE_UNSUPPORTED = 0,
+    PROTO_TYPE_CAN,
+    PROTO_TYPE_ISO15765,
+    PROTO_TYPE_J1850VPW,
+    PROTO_TYPE_J1850PWM,
+    PROTO_TYPE_ISO9141,
+    PROTO_TYPE_ISO14230
+} protocol_type_t;
+
+/* ============================================================================
+ * Protocol ID Mapping
+ * Maps J2534-1/2 protocol IDs and determines protocol type
+ * WiCAN Pro supports CAN, ISO15765, J1850, ISO9141, ISO14230 via STN chip
+ * ============================================================================ */
+static protocol_type_t get_protocol_type(uint32_t protocol_id, uint32_t *mapped_protocol)
 {
-    *is_iso15765 = false;
+    *mapped_protocol = protocol_id;
     
     switch (protocol_id) {
-        /* Standard J2534-1 protocols */
-        case CAN:           /* 0x05 */
-            return CAN;
-        case ISO15765:      /* 0x06 */
-            *is_iso15765 = true;
-            return ISO15765;
+        /* Standard J2534-1 CAN protocols */
+        case CAN:               /* 0x05 */
+            return PROTO_TYPE_CAN;
+        case ISO15765:          /* 0x06 */
+            return PROTO_TYPE_ISO15765;
+            
+        /* J1850 protocols - supported via STN OBD chip */
+        case J1850VPW:          /* 0x01 - GM, Chrysler (10.4 kbaud) */
+            return PROTO_TYPE_J1850VPW;
+        case J1850PWM:          /* 0x02 - Ford (41.6 kbaud) */
+            return PROTO_TYPE_J1850PWM;
+        case J1850VPW_PS:       /* 0x8000 - J2534-2 extended */
+            *mapped_protocol = J1850VPW;
+            return PROTO_TYPE_J1850VPW;
+        case J1850PWM_PS:       /* 0x8001 - J2534-2 extended */
+            *mapped_protocol = J1850PWM;
+            return PROTO_TYPE_J1850PWM;
+            
+        /* ISO9141 - K-line, supported via STN OBD chip */
+        case ISO9141:           /* 0x03 */
+            return PROTO_TYPE_ISO9141;
+        case ISO9141_PS:        /* 0x8002 - J2534-2 extended */
+            *mapped_protocol = ISO9141;
+            return PROTO_TYPE_ISO9141;
+            
+        /* ISO14230 (KWP2000) - K-line, supported via STN OBD chip */
+        case ISO14230:          /* 0x04 */
+            return PROTO_TYPE_ISO14230;
+        case ISO14230_PS:       /* 0x8003 - J2534-2 extended */
+            *mapped_protocol = ISO14230;
+            return PROTO_TYPE_ISO14230;
             
         /* J2534-2 Extended CAN protocols - map to CAN */
-        case CAN_PS:        /* 0x8004 */
-        case SW_CAN_PS:     /* 0x8008 - Single-Wire CAN */
-        case CAN_CH1:       /* 0x9000 */
-        case CAN_CH2:       /* 0x9001 */
-            return CAN;
+        case CAN_PS:            /* 0x8004 */
+        case SW_CAN_PS:         /* 0x8008 - Single-Wire CAN */
+        case CAN_CH1:           /* 0x9000 */
+        case CAN_CH2:           /* 0x9001 */
+            *mapped_protocol = CAN;
+            return PROTO_TYPE_CAN;
             
         /* J2534-2 Extended ISO15765 protocols - map to ISO15765 */
         case ISO15765_PS:       /* 0x8005 */
         case SW_ISO15765_PS:    /* 0x8007 */
         case ISO15765_LOGIC:    /* 0x800C */
-            *is_iso15765 = true;
-            return ISO15765;
+            *mapped_protocol = ISO15765;
+            return PROTO_TYPE_ISO15765;
             
         /* Unsupported protocols */
         default:
-            return 0;
+            return PROTO_TYPE_UNSUPPORTED;
     }
 }
 
@@ -365,8 +405,8 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
 {
     j2534_device_t *device;
     j2534_channel_t *channel;
-    bool is_iso15765 = false;
     uint32_t mapped_protocol;
+    protocol_type_t proto_type;
     
     char dbg[256];
     sprintf(dbg, "[J2534] PassThruConnect: DeviceID=%lu ProtocolID=0x%lX Flags=0x%lX BaudRate=%lu\n",
@@ -378,17 +418,18 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
         return ERR_NULL_PARAMETER;
     }
     
-    /* Map extended protocol IDs to base CAN/ISO15765 */
-    mapped_protocol = map_protocol_to_can(ProtocolID, &is_iso15765);
-    if (mapped_protocol == 0) {
+    /* Get protocol type and mapped base protocol ID */
+    proto_type = get_protocol_type(ProtocolID, &mapped_protocol);
+    if (proto_type == PROTO_TYPE_UNSUPPORTED) {
         sprintf(dbg, "[J2534] PassThruConnect: Unsupported protocol 0x%lX\n", ProtocolID);
         OutputDebugStringA(dbg);
         set_error("Unsupported protocol");
         return ERR_INVALID_PROTOCOL_ID;
     }
     
-    sprintf(dbg, "[J2534] PassThruConnect: Mapped protocol 0x%lX -> 0x%lX (ISO15765=%d)\n",
-            ProtocolID, mapped_protocol, is_iso15765);
+    const char *proto_names[] = {"UNSUPPORTED", "CAN", "ISO15765", "J1850VPW", "J1850PWM", "ISO9141", "ISO14230"};
+    sprintf(dbg, "[J2534] PassThruConnect: Protocol type=%s (0x%lX -> 0x%lX)\n",
+            proto_names[proto_type], ProtocolID, (unsigned long)mapped_protocol);
     OutputDebugStringA(dbg);
     
     EnterCriticalSection(&g_cs_driver);
@@ -408,10 +449,10 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     }
     
     uint32_t fw_channel_id = 0;
-    if (!wican_can_connect(&device->wican_ctx, ProtocolID, Flags, BaudRate, &fw_channel_id)) {
+    if (!wican_can_connect(&device->wican_ctx, mapped_protocol, Flags, BaudRate, &fw_channel_id)) {
         channel->in_use = false;
         LeaveCriticalSection(&g_cs_driver);
-        set_error("Failed to connect to CAN bus");
+        set_error("Failed to connect protocol channel");
         return ERR_FAILED;
     }
     
