@@ -1,0 +1,2856 @@
+/*
+ * This file is part of the WiCAN project.
+ *
+ * Copyright (C) 2022  Meatpi Electronics.
+ * Written by Ali Slim <ali@meatpi.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"  // For esp_rom_delay_us() - microsecond precision timing
+#include "driver/twai.h"
+#include "j2534.h"
+#include "can.h"
+#include "stn_j2534.h"
+#include "hw_config.h"
+
+#define TAG "J2534"
+
+/* ============================================================================
+ * Static Variables
+ * ============================================================================ */
+
+static void (*j2534_response)(char*, uint32_t, QueueHandle_t *q, char* cmd_str) = NULL;
+static QueueHandle_t *j2534_rx_queue = NULL;
+
+// Track last TX CAN ID for functional addressing detection
+static uint32_t j2534_last_tx_id = 0;
+
+static bool j2534_device_open = false;
+static uint32_t j2534_device_id = 1;
+static j2534_channel_t j2534_channels[J2534_MAX_CHANNELS];
+static uint32_t j2534_active_channel = 0;
+static j2534_error_t j2534_last_error = J2534_STATUS_NOERROR;
+static char j2534_last_error_desc[80] = {0};
+
+// Packet parsing state
+static uint8_t j2534_rx_buffer[J2534_MAX_PACKET_SIZE];
+static uint32_t j2534_rx_index = 0;
+static uint8_t j2534_parse_state = 0;
+static uint16_t j2534_expected_len = 0;
+
+// RX message buffer for received CAN frames
+// 32 messages × ~280 bytes = ~9KB - reasonable for ESP32-S3
+// Large ISO-TP messages use separate reassembly buffer (isotp_rx_state.data)
+#define J2534_RX_MSG_BUFFER_SIZE 32
+static j2534_msg_t j2534_rx_msg_buffer[J2534_RX_MSG_BUFFER_SIZE];
+static volatile uint32_t j2534_rx_msg_head = 0;
+static volatile uint32_t j2534_rx_msg_tail = 0;
+
+// Flow Control state for multi-frame TX (synchronized with RX task)
+typedef struct {
+    volatile bool waiting_for_fc;        // True when we've sent FF and waiting for FC
+    volatile bool fc_received;           // True when FC has been received
+    volatile uint8_t fc_flow_status;     // FC Flow Status: 0=CTS, 1=Wait, 2=Overflow
+    volatile uint8_t fc_block_size;      // FC Block Size (0 = no limit)
+    volatile uint8_t fc_stmin;           // FC STmin (separation time)
+    volatile uint32_t fc_rx_id;          // CAN ID we're expecting FC from
+} isotp_fc_state_t;
+
+static isotp_fc_state_t isotp_fc_state = {0};
+
+// Periodic message support
+typedef struct {
+    bool active;
+    uint32_t msg_id;
+    uint32_t channel_id;
+    uint32_t interval_ms;
+    j2534_msg_t msg;
+    TickType_t last_send_time;
+} j2534_periodic_msg_t;
+
+#define J2534_MAX_PERIODIC_MSGS_ACTIVE 8
+static j2534_periodic_msg_t j2534_periodic_msgs[J2534_MAX_PERIODIC_MSGS_ACTIVE];
+static uint32_t j2534_next_periodic_id = 1;
+static TaskHandle_t j2534_periodic_task_handle = NULL;
+
+// ISO-TP multi-frame RX state
+// NOTE: This struct is accessed from multiple tasks (CAN RX task and J2534 command task)
+// The 'active' flag must be volatile to ensure proper cross-task visibility
+typedef struct {
+    volatile bool active;               // Multi-frame reception in progress (volatile for cross-task access)
+    uint32_t can_id;                    // CAN ID of the message
+    volatile uint32_t expected_length;  // Total expected data length
+    volatile uint32_t received_length;  // Data received so far
+    uint8_t next_seq_num;               // Next expected sequence number
+    uint8_t data[4128];                 // ISO-TP max data size
+    uint32_t flow_control_id;           // CAN ID for Flow Control response
+    bool is_extended;                   // Extended CAN ID flag
+    TickType_t last_frame_time;         // Timestamp of last frame
+    uint8_t block_size;                 // BS from our FC (0 = no limit)
+    uint8_t block_count;                // Frames received in current block
+} isotp_rx_state_t;
+
+static volatile isotp_rx_state_t isotp_rx_state = {0};
+
+// Track when we've just sent a large ISO-TP message and are awaiting response
+// This implements extended wait behavior for ECU programming operations
+// where responses can take 1-5+ seconds after large TransferData (0x36) requests
+typedef struct {
+    volatile bool awaiting_response;     // True after sending ISO-TP multi-frame
+    volatile TickType_t tx_complete_time; // When the TX completed
+    volatile uint32_t response_can_id;   // Expected response CAN ID
+} isotp_tx_state_t;
+
+static volatile isotp_tx_state_t isotp_tx_state = {0};
+
+/* ============================================================================
+ * Helper Functions
+ * ============================================================================ */
+
+/**
+ * @brief Check if a protocol ID is a legacy (non-CAN) protocol
+ * @return true if J1850 or ISO9141/ISO14230
+ */
+static bool j2534_is_legacy_protocol(uint32_t protocol_id)
+{
+    switch (protocol_id) {
+        case J2534_PROTOCOL_J1850VPW:
+        case J2534_PROTOCOL_J1850PWM:
+        case J2534_PROTOCOL_ISO9141:
+        case J2534_PROTOCOL_ISO14230:
+        case J2534_PROTOCOL_J1850VPW_PS:
+        case J2534_PROTOCOL_J1850PWM_PS:
+        case J2534_PROTOCOL_ISO9141_PS:
+        case J2534_PROTOCOL_ISO14230_PS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Buffer a TX indication (echo) message
+ * 
+ * J2534 requires that transmitted messages be echoed back to the application
+ * with RxStatus = 0x01 (TX_MSG_TYPE) to confirm successful transmission.
+ * This is critical for subnet discovery and other diagnostic operations.
+ */
+static void j2534_buffer_tx_indication(j2534_msg_t *orig_msg, uint32_t protocol_id)
+{
+    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    if (next_head == j2534_rx_msg_tail) {
+        ESP_LOGW(TAG, "TX indication: RX buffer full, dropping echo");
+        return;
+    }
+    
+    j2534_msg_t *msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+    memset(msg, 0, sizeof(j2534_msg_t));
+    
+    // For large messages using ext_data, only echo the CAN ID (first 4 bytes)
+    // since we can't store the full data in the RX buffer
+    uint8_t *src_data = (orig_msg->ext_data != NULL) ? orig_msg->ext_data : orig_msg->data;
+    uint32_t echo_size = orig_msg->data_size;
+    
+    // Limit echo size to buffer capacity
+    if (echo_size > J2534_MAX_MSG_DATA_SIZE) {
+        // For TX echo, only the first frame (CAN ID + up to 8 bytes) matters
+        echo_size = 12;  // 4-byte CAN ID + 8 bytes data max
+    }
+    
+    msg->protocol_id = protocol_id;
+    msg->tx_flags = orig_msg->tx_flags;
+    // CRITICAL FIX: data_size must reflect actual stored data, not original message size
+    // Otherwise ReadMsgs will try to copy garbage memory past end of data[] buffer
+    msg->data_size = echo_size;  
+    msg->extra_data_index = echo_size;
+    memcpy(msg->data, src_data, echo_size);
+    
+    // Set TX_MSG_TYPE flag to indicate this is a TX echo/confirmation
+    msg->rx_status = J2534_TX_MSG_TYPE_MASK;  // 0x01 = TX_MSG_TYPE
+    msg->timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+    msg->ext_data = NULL;  // Never use ext_data for buffered messages
+    
+    j2534_rx_msg_head = next_head;
+    ESP_LOGI(TAG, "TX indication buffered: ID=0x%02X%02X%02X%02X, size=%lu (orig=%lu)",
+             msg->data[0], msg->data[1], msg->data[2], msg->data[3], msg->data_size, orig_msg->data_size);
+}
+
+static uint8_t j2534_calc_checksum(uint8_t *data, uint32_t len)
+{
+    uint8_t checksum = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+
+static void j2534_set_error(j2534_error_t error, const char *desc)
+{
+    j2534_last_error = error;
+    if (desc) {
+        strncpy(j2534_last_error_desc, desc, sizeof(j2534_last_error_desc) - 1);
+        j2534_last_error_desc[sizeof(j2534_last_error_desc) - 1] = '\0';
+    } else {
+        j2534_last_error_desc[0] = '\0';
+    }
+}
+
+static j2534_channel_t* j2534_get_channel(uint32_t channel_id)
+{
+    for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
+        if (j2534_channels[i].active && j2534_channels[i].channel_id == channel_id) {
+            return &j2534_channels[i];
+        }
+    }
+    return NULL;
+}
+
+static j2534_channel_t* j2534_alloc_channel(void)
+{
+    for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
+        if (!j2534_channels[i].active) {
+            return &j2534_channels[i];
+        }
+    }
+    return NULL;
+}
+
+static uint32_t j2534_baudrate_to_can(uint32_t baudrate)
+{
+    switch (baudrate) {
+        case 5000:   return CAN_5K;
+        case 10000:  return CAN_10K;
+        case 20000:  return CAN_20K;
+        case 25000:  return CAN_25K;
+        case 50000:  return CAN_50K;
+        case 100000: return CAN_100K;
+        case 125000: return CAN_125K;
+        case 250000: return CAN_250K;
+        case 500000: return CAN_500K;
+        case 800000: return CAN_800K;
+        case 1000000: return CAN_1000K;
+        // Note: SW-CAN (33.3K) and MS-CAN (95.2K) go through OBD interpreter chip, not native CAN
+        default: return CAN_500K;      // Default to 500K
+    }
+}
+
+static void j2534_send_response(uint8_t cmd, j2534_error_t status, 
+                                uint8_t *data, uint16_t data_len, QueueHandle_t *q)
+{
+    static uint8_t resp_buf[J2534_MAX_PACKET_SIZE];
+    uint32_t idx = 0;
+    
+    resp_buf[idx++] = J2534_SYNC1;
+    resp_buf[idx++] = J2534_SYNC2;
+    resp_buf[idx++] = cmd | J2534_RESPONSE_FLAG;
+    resp_buf[idx++] = (uint8_t)status;
+    resp_buf[idx++] = (data_len >> 8) & 0xFF;
+    resp_buf[idx++] = data_len & 0xFF;
+    
+    if (data && data_len > 0) {
+        memcpy(&resp_buf[idx], data, data_len);
+        idx += data_len;
+    }
+    
+    resp_buf[idx] = j2534_calc_checksum(resp_buf, idx);
+    idx++;
+    
+    if (j2534_response) {
+        j2534_response((char*)resp_buf, idx, q, NULL);
+    }
+}
+
+/* ============================================================================
+ * Periodic Message Task
+ * ============================================================================ */
+
+static void j2534_periodic_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Periodic message task started");
+    
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+        
+        for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
+            if (!j2534_periodic_msgs[i].active) continue;
+            
+            TickType_t elapsed = now - j2534_periodic_msgs[i].last_send_time;
+            if (elapsed >= pdMS_TO_TICKS(j2534_periodic_msgs[i].interval_ms)) {
+                // Time to send this periodic message
+                j2534_channel_t *ch = j2534_get_channel(j2534_periodic_msgs[i].channel_id);
+                if (ch && ch->active) {
+                    j2534_msg_t *msg = &j2534_periodic_msgs[i].msg;
+                    
+                    twai_message_t can_frame;
+                    memset(&can_frame, 0, sizeof(can_frame));
+                    
+                    // Extract CAN ID from first 4 bytes
+                    can_frame.identifier = (msg->data[0] << 24) | (msg->data[1] << 16) |
+                                           (msg->data[2] << 8) | msg->data[3];
+                    
+                    if (msg->tx_flags & J2534_CAN_29BIT_ID) {
+                        can_frame.extd = 1;
+                    } else {
+                        can_frame.extd = 0;
+                        can_frame.identifier &= 0x7FF;
+                    }
+                    
+                    // Copy payload (skip first 4 bytes which are CAN ID)
+                    uint32_t payload_len = msg->data_size - 4;
+                    if (payload_len > 8) payload_len = 8;
+                    can_frame.data_length_code = payload_len;
+                    memcpy(can_frame.data, &msg->data[4], payload_len);
+                    
+                    can_frame.self = ch->loopback ? 1 : 0;
+                    
+                    esp_err_t result = can_send(&can_frame, pdMS_TO_TICKS(50));
+                    if (result == ESP_OK) {
+                        ESP_LOGD(TAG, "Periodic msg %lu sent, ID=0x%lX", 
+                                 j2534_periodic_msgs[i].msg_id, can_frame.identifier);
+                    }
+                }
+                
+                j2534_periodic_msgs[i].last_send_time = now;
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1));  // 1ms resolution
+    }
+}
+
+static j2534_error_t j2534_start_periodic_msg(uint32_t channel_id, j2534_msg_t *msg,
+                                              uint32_t interval_ms, uint32_t *msg_id)
+{
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    if (interval_ms < 5 || interval_ms > 65535) {
+        j2534_set_error(J2534_ERR_INVALID_TIME_INTERVAL, "Invalid interval");
+        return J2534_ERR_INVALID_TIME_INTERVAL;
+    }
+    
+    // Find free slot
+    int slot = -1;
+    for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
+        if (!j2534_periodic_msgs[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    
+    if (slot < 0) {
+        j2534_set_error(J2534_ERR_EXCEEDED_LIMIT, "Max periodic messages reached");
+        return J2534_ERR_EXCEEDED_LIMIT;
+    }
+    
+    // Setup periodic message
+    j2534_periodic_msgs[slot].active = true;
+    j2534_periodic_msgs[slot].msg_id = j2534_next_periodic_id++;
+    j2534_periodic_msgs[slot].channel_id = channel_id;
+    j2534_periodic_msgs[slot].interval_ms = interval_ms;
+    memcpy(&j2534_periodic_msgs[slot].msg, msg, sizeof(j2534_msg_t));
+    j2534_periodic_msgs[slot].last_send_time = xTaskGetTickCount();
+    
+    *msg_id = j2534_periodic_msgs[slot].msg_id;
+    
+    // Start task if not running
+    if (j2534_periodic_task_handle == NULL) {
+        xTaskCreate(j2534_periodic_task, "j2534_periodic", 2048, NULL, 5, &j2534_periodic_task_handle);
+    }
+    
+    ESP_LOGI(TAG, "Started periodic msg %lu on ch %lu, interval %lu ms", *msg_id, channel_id, interval_ms);
+    return J2534_STATUS_NOERROR;
+}
+
+static j2534_error_t j2534_stop_periodic_msg(uint32_t channel_id, uint32_t msg_id)
+{
+    for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
+        if (j2534_periodic_msgs[i].active && j2534_periodic_msgs[i].msg_id == msg_id) {
+            j2534_periodic_msgs[i].active = false;
+            ESP_LOGI(TAG, "Stopped periodic msg %lu", msg_id);
+            return J2534_STATUS_NOERROR;
+        }
+    }
+    
+    j2534_set_error(J2534_ERR_INVALID_MSG_ID, "Invalid message ID");
+    return J2534_ERR_INVALID_MSG_ID;
+}
+
+/* ============================================================================
+ * J2534 API Implementation
+ * ============================================================================ */
+
+void j2534_init(void (*send_callback)(char*, uint32_t, QueueHandle_t *q, char* cmd_str),
+                QueueHandle_t *rx_queue)
+{
+    ESP_LOGI(TAG, "Initializing J2534 module");
+    
+    j2534_response = send_callback;
+    j2534_rx_queue = rx_queue;
+    
+    // Initialize channels
+    memset(j2534_channels, 0, sizeof(j2534_channels));
+    for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
+        j2534_channels[i].channel_id = i + 1;
+    }
+    
+    // Initialize periodic messages
+    memset(j2534_periodic_msgs, 0, sizeof(j2534_periodic_msgs));
+    j2534_next_periodic_id = 1;
+    
+    // Initialize FC state
+    memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
+    
+    // Reset state
+    j2534_device_open = false;
+    j2534_active_channel = 0;
+    j2534_rx_index = 0;
+    j2534_parse_state = 0;
+    j2534_rx_msg_head = 0;
+    j2534_rx_msg_tail = 0;
+    
+    j2534_set_error(J2534_STATUS_NOERROR, NULL);
+    
+    ESP_LOGI(TAG, "J2534 module initialized");
+}
+
+j2534_error_t j2534_open(uint32_t *device_id)
+{
+    if (j2534_device_open) {
+        // Auto-reset if device is already open (likely from previous crashed session)
+        ESP_LOGW(TAG, "Device already open, auto-resetting for new session");
+        j2534_reset();
+    }
+    
+    j2534_device_open = true;
+    *device_id = j2534_device_id;
+    
+    ESP_LOGI(TAG, "Device opened, ID: %lu", j2534_device_id);
+    return J2534_STATUS_NOERROR;
+}
+
+j2534_error_t j2534_close(uint32_t device_id)
+{
+    if (!j2534_device_open) {
+        j2534_set_error(J2534_ERR_DEVICE_NOT_CONNECTED, "Device not open");
+        return J2534_ERR_DEVICE_NOT_CONNECTED;
+    }
+    
+    if (device_id != j2534_device_id) {
+        j2534_set_error(J2534_ERR_INVALID_DEVICE_ID, "Invalid device ID");
+        return J2534_ERR_INVALID_DEVICE_ID;
+    }
+    
+    // Close all channels
+    for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
+        if (j2534_channels[i].active) {
+            j2534_disconnect(j2534_channels[i].channel_id);
+        }
+    }
+    
+    j2534_device_open = false;
+    ESP_LOGI(TAG, "Device closed");
+    return J2534_STATUS_NOERROR;
+}
+
+bool j2534_is_active(void)
+{
+    return j2534_device_open && j2534_active_channel > 0;
+}
+
+uint32_t j2534_get_protocol(void)
+{
+    j2534_channel_t *ch = j2534_get_channel(j2534_active_channel);
+    if (ch) {
+        return ch->protocol_id;
+    }
+    return 0;
+}
+
+void j2534_reset(void)
+{
+    ESP_LOGI(TAG, "J2534 reset - closing all channels and device");
+    
+    // Close all channels
+    for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
+        if (j2534_channels[i].active) {
+            j2534_disconnect(j2534_channels[i].channel_id);
+        }
+    }
+    
+    // Reset device state
+    j2534_device_open = false;
+    j2534_active_channel = 0;
+    j2534_set_error(J2534_STATUS_NOERROR, NULL);
+    
+    // Reset parser state
+    j2534_parse_state = 0;
+    j2534_rx_index = 0;
+    j2534_expected_len = 0;
+    
+    ESP_LOGI(TAG, "J2534 reset complete");
+}
+
+j2534_error_t j2534_get_last_error(char *error_description)
+{
+    if (error_description) {
+        strncpy(error_description, j2534_last_error_desc, 80);
+    }
+    return j2534_last_error;
+}
+
+j2534_error_t j2534_read_version(uint32_t device_id,
+                                 char *firmware_version,
+                                 char *dll_version,
+                                 char *api_version)
+{
+    if (!j2534_device_open || device_id != j2534_device_id) {
+        return J2534_ERR_INVALID_DEVICE_ID;
+    }
+    
+    if (firmware_version) strncpy(firmware_version, "04.53", 32);  // Fixed: raw CAN applies PASS filters
+    if (dll_version) strncpy(dll_version, J2534_DLL_VERSION, 32);
+    if (api_version) strncpy(api_version, J2534_API_VERSION, 32);
+    
+    return J2534_STATUS_NOERROR;
+}
+
+/* ============================================================================
+ * Channel Connect/Disconnect
+ * ============================================================================ */
+
+j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
+                            uint32_t flags, uint32_t baudrate,
+                            uint32_t *channel_id)
+{
+    if (!j2534_device_open || device_id != j2534_device_id) {
+        j2534_set_error(J2534_ERR_INVALID_DEVICE_ID, "Invalid device ID");
+        return J2534_ERR_INVALID_DEVICE_ID;
+    }
+    
+    // Validate protocol and determine if CAN or legacy (via OBD chip)
+    uint32_t base_protocol = protocol_id;
+    bool is_legacy_protocol = false;
+    stn_protocol_t stn_proto = STN_PROTO_AUTO;
+    
+    switch (protocol_id) {
+        // CAN-based protocols - use ESP32 TWAI directly
+        case J2534_PROTOCOL_CAN:           // 0x05
+        case J2534_PROTOCOL_ISO15765:      // 0x06
+            break;  // Standard protocols - use as-is
+            
+        // J2534-2 Extended CAN protocols - map to CAN
+        case J2534_PROTOCOL_CAN_PS:        // 0x8004
+        case J2534_PROTOCOL_SW_CAN_PS:     // 0x8008 (GM Single-Wire CAN)
+        case J2534_PROTOCOL_CAN_CH1:       // 0x9000
+        case J2534_PROTOCOL_CAN_CH2:       // 0x9001
+            base_protocol = J2534_PROTOCOL_CAN;
+            ESP_LOGI(TAG, "Mapping extended protocol 0x%04lX to CAN", protocol_id);
+            break;
+            
+        // J2534-2 Extended ISO15765 protocols - map to ISO15765
+        case J2534_PROTOCOL_ISO15765_PS:   // 0x8005
+        case J2534_PROTOCOL_SW_ISO15765_PS: // 0x8007
+            base_protocol = J2534_PROTOCOL_ISO15765;
+            ESP_LOGI(TAG, "Mapping extended protocol 0x%04lX to ISO15765", protocol_id);
+            break;
+            
+#if HARDWARE_VER == WICAN_PRO
+        // Legacy protocols - route through OBD interpreter chip
+        case J2534_PROTOCOL_J1850VPW:      // 0x01
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_J1850VPW;
+            ESP_LOGI(TAG, "Using OBD chip for J1850 VPW");
+            break;
+            
+        case J2534_PROTOCOL_J1850PWM:      // 0x02
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_J1850PWM;
+            ESP_LOGI(TAG, "Using OBD chip for J1850 PWM");
+            break;
+            
+        case J2534_PROTOCOL_ISO9141:       // 0x03
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_ISO9141;
+            ESP_LOGI(TAG, "Using OBD chip for ISO 9141");
+            break;
+            
+        case J2534_PROTOCOL_ISO14230:      // 0x04
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_ISO14230_FAST;  // Default to fast init
+            ESP_LOGI(TAG, "Using OBD chip for ISO 14230 (KWP2000)");
+            break;
+            
+        // Extended legacy protocols
+        case J2534_PROTOCOL_J1850VPW_PS:   // 0x8000
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_J1850VPW;
+            base_protocol = J2534_PROTOCOL_J1850VPW;
+            break;
+            
+        case J2534_PROTOCOL_J1850PWM_PS:   // 0x8001
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_J1850PWM;
+            base_protocol = J2534_PROTOCOL_J1850PWM;
+            break;
+            
+        case J2534_PROTOCOL_ISO9141_PS:    // 0x8002
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_ISO9141;
+            base_protocol = J2534_PROTOCOL_ISO9141;
+            break;
+            
+        case J2534_PROTOCOL_ISO14230_PS:   // 0x8003
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_ISO14230_FAST;
+            base_protocol = J2534_PROTOCOL_ISO14230;
+            break;
+#endif
+            
+        default:
+            j2534_set_error(J2534_ERR_INVALID_PROTOCOL_ID, "Unsupported protocol");
+            ESP_LOGE(TAG, "Unsupported protocol ID: 0x%04lX", protocol_id);
+            return J2534_ERR_INVALID_PROTOCOL_ID;
+    }
+    
+    // Allocate channel
+    j2534_channel_t *ch = j2534_alloc_channel();
+    if (!ch) {
+        j2534_set_error(J2534_ERR_EXCEEDED_LIMIT, "No free channels");
+        return J2534_ERR_EXCEEDED_LIMIT;
+    }
+    
+#if HARDWARE_VER == WICAN_PRO
+    if (is_legacy_protocol) {
+        // Initialize OBD chip bridge if needed
+        if (stn_j2534_init() != ESP_OK) {
+            j2534_set_error(J2534_ERR_FAILED, "OBD chip not ready");
+            return J2534_ERR_FAILED;
+        }
+        
+        // Select protocol on OBD chip
+        stn_j2534_status_t status = stn_j2534_select_protocol(stn_proto);
+        if (status != STN_J2534_STATUS_OK) {
+            j2534_set_error(J2534_ERR_FAILED, "Failed to select protocol on OBD chip");
+            return J2534_ERR_FAILED;
+        }
+        
+        // Disable CAN since we're using legacy protocol
+        can_disable();
+    } else 
+#endif
+    {
+        // Configure CAN for CAN-based protocols
+        can_disable();
+        uint32_t can_rate = j2534_baudrate_to_can(baudrate);
+        can_set_bitrate(can_rate);
+        can_set_silent(0);
+        can_set_loopback((flags & 0x01) ? 1 : 0);
+        can_enable();
+        
+        // Wait for CAN to be ready (CAN_ENABLE_BIT is set by timer after ~10ms)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    
+    // Setup channel
+    ch->active = true;
+    ch->protocol_id = protocol_id;
+    ch->flags = flags;
+    ch->baudrate = baudrate;
+    ch->loopback = (flags & 0x01) ? true : false;
+    ch->filter_count = 0;
+    ch->funct_msg_count = 0;
+    ch->iso15765_bs = 0;
+    ch->iso15765_stmin = 0;
+    ch->iso15765_ext_addr = false;
+    ch->iso15765_ext_addr_byte = 0;
+    
+    // Clear RX buffer
+    j2534_rx_msg_head = 0;
+    j2534_rx_msg_tail = 0;
+    
+    *channel_id = ch->channel_id;
+    j2534_active_channel = ch->channel_id;
+    
+    ESP_LOGI(TAG, "Connected channel %lu, protocol %lu (base %lu), baud %lu, legacy=%d", 
+             ch->channel_id, protocol_id, base_protocol, baudrate, is_legacy_protocol);
+    
+    return J2534_STATUS_NOERROR;
+}
+
+j2534_error_t j2534_disconnect(uint32_t channel_id)
+{
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    // Stop all periodic messages for this channel
+    for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
+        if (j2534_periodic_msgs[i].active && j2534_periodic_msgs[i].channel_id == channel_id) {
+            j2534_periodic_msgs[i].active = false;
+            ESP_LOGI(TAG, "Stopped periodic msg %lu during disconnect", j2534_periodic_msgs[i].msg_id);
+        }
+    }
+    
+    // Reset ISO-TP state (in case a transfer was in progress)
+    memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
+    memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
+    memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+    
+    // Clear filters
+    memset(ch->filters, 0, sizeof(ch->filters));
+    ch->filter_count = 0;
+    
+    // Deactivate channel
+    ch->active = false;
+    
+    if (j2534_active_channel == channel_id) {
+        j2534_active_channel = 0;
+        can_disable();
+    }
+    
+    ESP_LOGI(TAG, "Disconnected channel %lu", channel_id);
+    return J2534_STATUS_NOERROR;
+}
+
+/* ============================================================================
+ * Message Filters
+ * ============================================================================ */
+
+j2534_error_t j2534_start_msg_filter(uint32_t channel_id,
+                                     uint32_t filter_type,
+                                     j2534_msg_t *mask_msg,
+                                     j2534_msg_t *pattern_msg,
+                                     j2534_msg_t *flow_control_msg,
+                                     uint32_t *filter_id)
+{
+    ESP_LOGI(TAG, "j2534_start_msg_filter: ch_id=%lu type=%lu", channel_id, filter_type);
+    
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        ESP_LOGE(TAG, "j2534_start_msg_filter: Invalid channel ID %lu", channel_id);
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    ESP_LOGI(TAG, "j2534_start_msg_filter: channel active=%d filter_count=%lu", 
+             ch->active, ch->filter_count);
+    
+    // Log filter details
+    if (mask_msg) {
+        ESP_LOGI(TAG, "  MASK: size=%lu data=%02X %02X %02X %02X...",
+                 mask_msg->data_size,
+                 mask_msg->data_size > 0 ? mask_msg->data[0] : 0,
+                 mask_msg->data_size > 1 ? mask_msg->data[1] : 0,
+                 mask_msg->data_size > 2 ? mask_msg->data[2] : 0,
+                 mask_msg->data_size > 3 ? mask_msg->data[3] : 0);
+    }
+    if (pattern_msg) {
+        ESP_LOGI(TAG, "  PATTERN: size=%lu data=%02X %02X %02X %02X...",
+                 pattern_msg->data_size,
+                 pattern_msg->data_size > 0 ? pattern_msg->data[0] : 0,
+                 pattern_msg->data_size > 1 ? pattern_msg->data[1] : 0,
+                 pattern_msg->data_size > 2 ? pattern_msg->data[2] : 0,
+                 pattern_msg->data_size > 3 ? pattern_msg->data[3] : 0);
+    }
+    if (flow_control_msg) {
+        ESP_LOGI(TAG, "  FLOW_CTRL: size=%lu data=%02X %02X %02X %02X...",
+                 flow_control_msg->data_size,
+                 flow_control_msg->data_size > 0 ? flow_control_msg->data[0] : 0,
+                 flow_control_msg->data_size > 1 ? flow_control_msg->data[1] : 0,
+                 flow_control_msg->data_size > 2 ? flow_control_msg->data[2] : 0,
+                 flow_control_msg->data_size > 3 ? flow_control_msg->data[3] : 0);
+    }
+    
+    if (ch->filter_count >= J2534_MAX_FILTERS) {
+        j2534_set_error(J2534_ERR_EXCEEDED_LIMIT, "Max filters reached");
+        return J2534_ERR_EXCEEDED_LIMIT;
+    }
+    
+    // Find free filter slot
+    j2534_filter_t *filter = NULL;
+    uint32_t fid = 0;
+    for (int i = 0; i < J2534_MAX_FILTERS; i++) {
+        if (!ch->filters[i].active) {
+            filter = &ch->filters[i];
+            fid = i + 1;
+            break;
+        }
+    }
+    
+    if (!filter) {
+        j2534_set_error(J2534_ERR_EXCEEDED_LIMIT, "No free filter slots");
+        return J2534_ERR_EXCEEDED_LIMIT;
+    }
+    
+    // Setup filter
+    filter->filter_id = fid;
+    filter->filter_type = filter_type;
+    filter->protocol_id = ch->protocol_id;
+    filter->active = true;
+    
+    // Copy mask (first 4 bytes of data are CAN ID)
+    if (mask_msg && mask_msg->data_size >= 4) {
+        memcpy(filter->mask, mask_msg->data, 4);
+    }
+    
+    // Copy pattern
+    if (pattern_msg && pattern_msg->data_size >= 4) {
+        memcpy(filter->pattern, pattern_msg->data, 4);
+    }
+    
+    // Copy flow control (for ISO15765)
+    if (flow_control_msg && flow_control_msg->data_size >= 4) {
+        memcpy(filter->flow_control, flow_control_msg->data, 4);
+    }
+    
+    ch->filter_count++;
+    *filter_id = fid;
+    
+    // Clear RX buffer when filter is set (discard any unfiltered messages)
+    j2534_rx_msg_head = 0;
+    j2534_rx_msg_tail = 0;
+    
+    ESP_LOGI(TAG, "Started filter %lu on channel %lu", fid, channel_id);
+    return J2534_STATUS_NOERROR;
+}
+
+j2534_error_t j2534_stop_msg_filter(uint32_t channel_id, uint32_t filter_id)
+{
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    if (filter_id == 0 || filter_id > J2534_MAX_FILTERS) {
+        j2534_set_error(J2534_ERR_INVALID_FILTER_ID, "Invalid filter ID");
+        return J2534_ERR_INVALID_FILTER_ID;
+    }
+    
+    j2534_filter_t *filter = &ch->filters[filter_id - 1];
+    if (!filter->active) {
+        j2534_set_error(J2534_ERR_INVALID_FILTER_ID, "Filter not active");
+        return J2534_ERR_INVALID_FILTER_ID;
+    }
+    
+    filter->active = false;
+    ch->filter_count--;
+    
+    ESP_LOGI(TAG, "Stopped filter %lu on channel %lu", filter_id, channel_id);
+    return J2534_STATUS_NOERROR;
+}
+
+/* ============================================================================
+ * Read/Write Messages
+ * ============================================================================ */
+
+j2534_error_t j2534_read_msgs(uint32_t channel_id, j2534_msg_t *msgs,
+                              uint32_t *num_msgs, uint32_t timeout)
+{
+    ESP_LOGI(TAG, "j2534_read_msgs: ch=%lu num=%lu timeout=%lu", channel_id, *num_msgs, timeout);
+    ESP_LOGI(TAG, "j2534_read_msgs: buffer head=%lu tail=%lu", j2534_rx_msg_head, j2534_rx_msg_tail);
+    
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    if (!msgs || !num_msgs) {
+        j2534_set_error(J2534_ERR_NULL_PARAMETER, "NULL parameter");
+        return J2534_ERR_NULL_PARAMETER;
+    }
+    
+    // CRITICAL FIX: Also switch active channel on READ, not just write!
+    // Diagnostic software often calls ReadMsgs after switching from raw CAN to ISO15765.
+    // If we don't switch the active channel here, RX processing in j2534_can_to_msg
+    // will use the wrong protocol and return raw CAN format instead of ISO-TP.
+    if (j2534_active_channel != channel_id) {
+        ESP_LOGI(TAG, "j2534_read_msgs: Switching active channel %lu -> %lu (proto=0x%lX)",
+                 j2534_active_channel, channel_id, ch->protocol_id);
+        
+        // Flush CAN hardware receive queue - stale frames from wrong channel
+        twai_clear_receive_queue();
+        
+        // Small delay for in-flight RX processing to complete
+        vTaskDelay(pdMS_TO_TICKS(5));
+        
+        // Switch active channel
+        j2534_active_channel = channel_id;
+        
+        // Clear stale messages from previous channel
+        j2534_rx_msg_head = 0;
+        j2534_rx_msg_tail = 0;
+        
+        // Reset ISO-TP state machines
+        memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
+        memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
+        memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+        
+        ESP_LOGI(TAG, "j2534_read_msgs: Channel switch complete, state cleared");
+    }
+    
+    uint32_t requested = *num_msgs;
+    uint32_t read_count = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout);
+    
+    // Maximum time to wait for a multi-frame message to complete (5 seconds)
+    // This prevents infinite hangs if the ECU stops responding mid-transfer
+    const TickType_t max_isotp_wait_ticks = pdMS_TO_TICKS(5000);
+    
+    // Log buffer state periodically during wait
+    uint32_t last_log_time = 0;
+    
+    while (read_count < requested) {
+        // Check for messages in buffer
+        if (j2534_rx_msg_head != j2534_rx_msg_tail) {
+            memcpy(&msgs[read_count], &j2534_rx_msg_buffer[j2534_rx_msg_tail], 
+                   sizeof(j2534_msg_t));
+            ESP_LOGI(TAG, "j2534_read_msgs: GOT msg[%lu] from buffer", read_count);
+            j2534_rx_msg_tail = (j2534_rx_msg_tail + 1) % J2534_RX_MSG_BUFFER_SIZE;
+            
+            // If we received a response (not a TX echo), clear the awaiting state
+            // TX echoes have RxStatus bit 0 set (TX_MSG_TYPE = 0x01)
+            if ((msgs[read_count].rx_status & 0x01) == 0) {
+                // This is an actual RX message, not a TX echo
+                if (isotp_tx_state.awaiting_response) {
+                    ESP_LOGI(TAG, "j2534_read_msgs: ECU response received, clearing await state");
+                    isotp_tx_state.awaiting_response = false;
+                }
+            }
+            
+            read_count++;
+        } else {
+            // Check timeout
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout_ticks) {
+                // Extended wait behavior: If a multi-frame ISO-TP reception is in progress,
+                // OR if we've just sent a large ISO-TP message and are awaiting response,
+                // keep waiting until the message completes or max wait time is reached.
+                // This is critical for large ECU responses (programming, etc.) that take
+                // longer than typical J2534 timeouts (e.g. 100ms x 6 = 600ms vs 1.2s response)
+                
+                // Case 1: Multi-frame ISO-TP RX in progress
+                if (isotp_rx_state.active) {
+                    // Check if we haven't exceeded the absolute maximum wait time
+                    if (elapsed < max_isotp_wait_ticks) {
+                        // Log that we're extending the wait for ISO-TP completion
+                        if ((elapsed - last_log_time) >= pdMS_TO_TICKS(200)) {
+                            ESP_LOGI(TAG, "j2534_read_msgs: ISO-TP RX in progress, extending wait... "
+                                     "rx=%lu/%lu elapsed=%lu ms",
+                                     isotp_rx_state.received_length, isotp_rx_state.expected_length,
+                                     elapsed * portTICK_PERIOD_MS);
+                            last_log_time = elapsed;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        continue;  // Don't break, keep waiting for ISO-TP to complete
+                    } else {
+                        ESP_LOGW(TAG, "j2534_read_msgs: ISO-TP RX max wait exceeded (%lu ms), aborting",
+                                 elapsed * portTICK_PERIOD_MS);
+                        isotp_rx_state.active = false;  // Abort the stale reception
+                    }
+                }
+                
+                // Case 2: We just sent a large ISO-TP TX and are awaiting ECU response
+                // This handles programming operations where ECU takes 1-5+ seconds to respond
+                // after receiving large TransferData (0x36) blocks
+                if (isotp_tx_state.awaiting_response) {
+                    TickType_t tx_elapsed = xTaskGetTickCount() - isotp_tx_state.tx_complete_time;
+                    if (tx_elapsed < max_isotp_wait_ticks) {
+                        // Log that we're extending the wait for ECU response
+                        if ((elapsed - last_log_time) >= pdMS_TO_TICKS(200)) {
+                            ESP_LOGI(TAG, "j2534_read_msgs: Awaiting ECU response on 0x%lX, extending wait... "
+                                     "elapsed=%lu ms since TX",
+                                     isotp_tx_state.response_can_id,
+                                     tx_elapsed * portTICK_PERIOD_MS);
+                            last_log_time = elapsed;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        continue;  // Don't break, keep waiting for ECU response
+                    } else {
+                        ESP_LOGW(TAG, "j2534_read_msgs: ECU response wait exceeded (%lu ms), giving up",
+                                 tx_elapsed * portTICK_PERIOD_MS);
+                        isotp_tx_state.awaiting_response = false;  // Clear the wait state
+                    }
+                }
+                
+                ESP_LOGI(TAG, "j2534_read_msgs: TIMEOUT after %lu ms", elapsed * portTICK_PERIOD_MS);
+                break;
+            }
+            // Log every 100ms while waiting
+            if ((elapsed - last_log_time) >= pdMS_TO_TICKS(100)) {
+                ESP_LOGI(TAG, "j2534_read_msgs: waiting... head=%lu tail=%lu elapsed=%lu%s%s",
+                         j2534_rx_msg_head, j2534_rx_msg_tail, elapsed * portTICK_PERIOD_MS,
+                         isotp_rx_state.active ? " (ISO-TP RX)" : "",
+                         isotp_tx_state.awaiting_response ? " (awaiting ECU)" : "");
+                last_log_time = elapsed;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    
+    *num_msgs = read_count;
+    ESP_LOGI(TAG, "j2534_read_msgs: returning %lu messages", read_count);
+    
+    if (read_count == 0) {
+        return J2534_ERR_BUFFER_EMPTY;
+    }
+    
+    return J2534_STATUS_NOERROR;
+}
+
+j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
+                               uint32_t *num_msgs, uint32_t timeout)
+{
+    j2534_channel_t *ch = j2534_get_channel(channel_id);
+    if (!ch) {
+        j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+        return J2534_ERR_INVALID_CHANNEL_ID;
+    }
+    
+    // CRITICAL FIX: Update active channel on write to ensure RX processing
+    // uses the correct protocol. Diagnostic software opens multiple channels (raw CAN for
+    // subnet discovery, ISO15765 for diagnostics). The last connected channel
+    // was used for RX, which caused responses to be processed with wrong protocol.
+    // By updating active channel on each write, we ensure RX processing matches
+    // the channel that sent the request.
+    if (j2534_active_channel != channel_id) {
+        ESP_LOGI(TAG, "j2534_write_msgs: Switching active channel %lu -> %lu (proto=0x%lX)",
+                 j2534_active_channel, channel_id, ch->protocol_id);
+        
+        // CRITICAL: Clear ALL stale state when switching channels
+        // This fixes Part 2 failures after Part 1 - stale ISO-TP state and
+        // buffered messages from Part 1's multi-frame transfers were corrupting Part 2
+        
+        // 1. Flush CAN hardware receive queue FIRST - this prevents frames
+        //    received during the channel switch from being processed with wrong protocol
+        twai_clear_receive_queue();
+        
+        // 2. Small delay to let any in-flight RX processing complete
+        //    The main task's CAN RX loop runs continuously - give it time to finish
+        vTaskDelay(pdMS_TO_TICKS(5));
+        
+        // 3. NOW switch the active channel - after flushing stale frames
+        j2534_active_channel = channel_id;
+        
+        // 4. Clear RX message buffer - stale messages from previous channel
+        j2534_rx_msg_head = 0;
+        j2534_rx_msg_tail = 0;
+        ESP_LOGI(TAG, "j2534_write_msgs: Cleared RX buffer on channel switch");
+        
+        // 5. Reset ALL ISO-TP state machines
+        memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
+        memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
+        memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+        ESP_LOGI(TAG, "j2534_write_msgs: Reset ISO-TP state machines on channel switch");
+        
+        // 6. Reset extended addressing flag on this channel
+        // (could have been incorrectly detected during previous operations)
+        ch->iso15765_ext_addr = false;
+        ch->iso15765_ext_addr_byte = 0;
+    }
+    
+    if (!msgs || !num_msgs) {
+        j2534_set_error(J2534_ERR_NULL_PARAMETER, "NULL parameter");
+        return J2534_ERR_NULL_PARAMETER;
+    }
+    
+    uint32_t requested = *num_msgs;
+    uint32_t sent_count = 0;
+    
+#if HARDWARE_VER == WICAN_PRO
+    // Handle legacy protocols through OBD chip
+    if (j2534_is_legacy_protocol(ch->protocol_id)) {
+        for (uint32_t i = 0; i < requested; i++) {
+            // For legacy protocols, data format is simpler:
+            // First bytes may be header (depending on protocol), then data
+            // For J1850/ISO, we send the entire message as hex through the OBD chip
+            
+            stn_j2534_msg_t responses[4];
+            uint32_t num_responses = 0;
+            
+            stn_j2534_status_t status = stn_j2534_send_message(
+                msgs[i].data,
+                msgs[i].data_size,
+                responses,
+                4,
+                &num_responses,
+                timeout > 0 ? timeout : 1000
+            );
+            
+            if (status == STN_J2534_STATUS_OK || num_responses > 0) {
+                sent_count++;
+                
+                // Buffer responses as RX messages
+                for (uint32_t r = 0; r < num_responses; r++) {
+                    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+                    if (next_head != j2534_rx_msg_tail) {
+                        j2534_msg_t *rx_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+                        memset(rx_msg, 0, sizeof(j2534_msg_t));
+                        rx_msg->protocol_id = ch->protocol_id;
+                        rx_msg->rx_status = 0;
+                        rx_msg->timestamp = responses[r].timestamp;
+                        rx_msg->data_size = responses[r].data_len;
+                        memcpy(rx_msg->data, responses[r].data, responses[r].data_len);
+                        j2534_rx_msg_head = next_head;
+                    }
+                }
+                
+                // Generate TX echo
+                j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+            }
+        }
+        
+        *num_msgs = sent_count;
+        return J2534_STATUS_NOERROR;
+    }
+#endif
+    
+    // CAN-based protocol handling (existing code)
+    
+    // CRITICAL: Clear stale ISO-TP state at the start of each write operation
+    // This fixes Part 2 failures after Part 1 multi-frame transfers:
+    // - awaiting_response from Part 1's last multi-frame TX would block Part 2 reads
+    // - active RX state from incomplete transfers would confuse Part 2 reception
+    // - waiting_for_fc from interrupted multi-frame could block new transfers
+    if (isotp_tx_state.awaiting_response) {
+        ESP_LOGI(TAG, "j2534_write_msgs: Clearing stale awaiting_response state");
+        isotp_tx_state.awaiting_response = false;
+    }
+    if (isotp_rx_state.active) {
+        ESP_LOGW(TAG, "j2534_write_msgs: Clearing stale ISO-TP RX state (was receiving from 0x%lX)", 
+                 isotp_rx_state.can_id);
+        isotp_rx_state.active = false;
+    }
+    if (isotp_fc_state.waiting_for_fc) {
+        ESP_LOGW(TAG, "j2534_write_msgs: Clearing stale FC wait state");
+        isotp_fc_state.waiting_for_fc = false;
+        isotp_fc_state.fc_received = false;
+    }
+    
+    for (uint32_t i = 0; i < requested; i++) {
+        twai_message_t can_frame;
+        memset(&can_frame, 0, sizeof(can_frame));
+        
+        // Extract CAN ID from first 4 bytes
+        if (msgs[i].data_size < 4) {
+            continue;
+        }
+        
+        // Use ext_data pointer if available (for large programming transfers)
+        uint8_t *msg_data_ptr = (msgs[i].ext_data != NULL) ? msgs[i].ext_data : msgs[i].data;
+        
+        can_frame.identifier = (msg_data_ptr[0] << 24) | 
+                               (msg_data_ptr[1] << 16) |
+                               (msg_data_ptr[2] << 8) | 
+                               msg_data_ptr[3];
+        
+        // Track last TX ID for functional addressing detection
+        // (j2534_last_tx_id is defined at file scope)
+        j2534_last_tx_id = can_frame.identifier;
+        ESP_LOGI(TAG, "j2534_write_msgs: TX ID=0x%lX data_size=%lu", j2534_last_tx_id, msgs[i].data_size);
+        
+        // Check for extended ID flag
+        if (msgs[i].tx_flags & J2534_CAN_29BIT_ID) {
+            can_frame.extd = 1;
+        } else {
+            can_frame.extd = 0;
+            can_frame.identifier &= 0x7FF;  // 11-bit mask
+        }
+        
+        // Get payload data (skip first 4 bytes which are CAN ID)
+        // msg_data_ptr already set above for ext_data support
+        uint32_t payload_len = msgs[i].data_size - 4;
+        uint8_t *payload = &msg_data_ptr[4];
+        
+        // Check if this is ISO15765 protocol - need to add ISO-TP framing
+        bool is_iso15765 = (ch->protocol_id == J2534_PROTOCOL_ISO15765 ||
+                           ch->protocol_id == J2534_PROTOCOL_ISO15765_PS ||
+                           ch->protocol_id == J2534_PROTOCOL_SW_ISO15765_PS);
+        
+        // DEBUG: Log the critical decision variables
+        ESP_LOGI(TAG, "j2534_write_msgs: ch_id=%lu ch->protocol_id=0x%lX is_iso15765=%d payload_len=%lu",
+                 channel_id, ch->protocol_id, is_iso15765, payload_len);
+        
+        // DEBUG: For large payloads, buffer a debug message showing protocol state
+        // This will appear in ReadMsgs with a special CAN ID (0xDEB06) so we can see it in DLL log
+        if (payload_len > 100) {
+            uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+            if (next_head != j2534_rx_msg_tail) {
+                j2534_msg_t *dbg_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+                memset(dbg_msg, 0, sizeof(j2534_msg_t));
+                dbg_msg->protocol_id = ch->protocol_id;
+                dbg_msg->rx_status = 0;  // Regular RX, not TX echo
+                dbg_msg->data_size = 12;
+                // CAN ID: 0x00DEB06 (DEBUG marker)
+                dbg_msg->data[0] = 0x00;
+                dbg_msg->data[1] = 0xDE;
+                dbg_msg->data[2] = 0xB0;
+                dbg_msg->data[3] = 0x06;
+                // Payload: protocol_id (4 bytes) + is_iso15765 (1 byte) + payload_len high 3 bytes
+                dbg_msg->data[4] = (ch->protocol_id >> 24) & 0xFF;
+                dbg_msg->data[5] = (ch->protocol_id >> 16) & 0xFF;
+                dbg_msg->data[6] = (ch->protocol_id >> 8) & 0xFF;
+                dbg_msg->data[7] = ch->protocol_id & 0xFF;
+                dbg_msg->data[8] = is_iso15765 ? 0x01 : 0x00;
+                dbg_msg->data[9] = (payload_len >> 16) & 0xFF;
+                dbg_msg->data[10] = (payload_len >> 8) & 0xFF;
+                dbg_msg->data[11] = payload_len & 0xFF;
+                dbg_msg->timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+                j2534_rx_msg_head = next_head;
+                ESP_LOGI(TAG, "DEBUG msg buffered: proto=0x%lX iso15765=%d len=%lu",
+                         ch->protocol_id, is_iso15765, payload_len);
+            }
+        }
+        
+        if (is_iso15765 && payload_len > 0) {
+            // ISO-TP framing required
+            bool use_padding = (msgs[i].tx_flags & J2534_ISO15765_PADDING) != 0;
+            
+            // Check if the payload already contains ISO-TP framing (pre-formatted by application)
+            // Some diagnostic apps send pre-padded 8-byte payloads with ISO-TP headers
+            // This includes extended addressing format: [ExtAddr][PCI][Data...]
+            bool is_preformatted = false;
+            
+            if (payload_len == 8) {
+                uint8_t first_byte = payload[0];
+                uint8_t second_byte = payload[1];
+                uint8_t first_pci_type = (first_byte >> 4) & 0x0F;
+                uint8_t second_pci_type = (second_byte >> 4) & 0x0F;
+                
+                // Check for normal addressing (first byte is PCI)
+                if (first_pci_type == 0x0 && (first_byte & 0x0F) <= 7 && (first_byte & 0x0F) > 0) {
+                    // Normal SF: 0x0N where N = 1-7
+                    is_preformatted = true;
+                    ESP_LOGI(TAG, "ISO15765 TX: Pre-formatted SF (normal), PCI=0x%02X", first_byte);
+                } 
+                else if (first_pci_type == 0x1) {
+                    // Normal FF: 0x1X XX
+                    is_preformatted = true;
+                    ESP_LOGI(TAG, "ISO15765 TX: Pre-formatted FF (normal), PCI=0x%02X", first_byte);
+                }
+                else if (first_pci_type == 0x3) {
+                    // Normal FC: 0x3X
+                    is_preformatted = true;
+                    ESP_LOGI(TAG, "ISO15765 TX: Pre-formatted FC (normal), PCI=0x%02X", first_byte);
+                }
+                // Check for extended addressing (first byte is address >= 0x40, second byte is PCI)
+                else if (first_pci_type >= 0x4 && second_pci_type <= 0x3) {
+                    // Extended addressing: [ExtAddr][PCI][Data...]
+                    is_preformatted = true;
+                    // Mark channel as using extended addressing
+                    ch->iso15765_ext_addr = true;
+                    ch->iso15765_ext_addr_byte = first_byte;
+                    ESP_LOGI(TAG, "ISO15765 TX: Pre-formatted (extended addr=0x%02X, PCI=0x%02X)", 
+                             first_byte, second_byte);
+                }
+                // Any other 8-byte payload - send as raw
+                else {
+                    is_preformatted = true;
+                    ESP_LOGI(TAG, "ISO15765 TX: Pre-formatted (raw 8-byte), first=0x%02X", first_byte);
+                }
+            }
+            
+            if (is_preformatted) {
+                // Send as-is - the app has already formatted the frame
+                can_frame.data_length_code = 8;
+                memcpy(can_frame.data, payload, 8);
+                ESP_LOGI(TAG, "ISO15765 TX: Sending pre-formatted frame ID=0x%lX", can_frame.identifier);
+            } else if (payload_len <= 7) {
+                // Single Frame (SF): PCI = 0x0N where N is data length
+                can_frame.data[0] = (uint8_t)payload_len;  // SF PCI
+                memcpy(&can_frame.data[1], payload, payload_len);
+                can_frame.data_length_code = 1 + payload_len;
+                
+                // Apply padding if requested
+                if (use_padding && can_frame.data_length_code < 8) {
+                    memset(&can_frame.data[can_frame.data_length_code], 0xAA, 
+                           8 - can_frame.data_length_code);
+                    can_frame.data_length_code = 8;
+                }
+                
+                ESP_LOGI(TAG, "ISO15765 SF: ID=0x%lX, PCI=0x%02X, len=%lu", 
+                         can_frame.identifier, can_frame.data[0], payload_len);
+            } else {
+                // Multi-frame: First Frame (FF) + Consecutive Frames (CF)
+                // FF PCI: 0x1X XX where XXX is total data length (12 bits)
+                can_frame.data[0] = 0x10 | ((payload_len >> 8) & 0x0F);
+                can_frame.data[1] = payload_len & 0xFF;
+                memcpy(&can_frame.data[2], payload, 6);  // First 6 bytes
+                can_frame.data_length_code = 8;
+                
+                ESP_LOGI(TAG, "ISO15765 FF: ID=0x%lX, total_len=%lu", 
+                         can_frame.identifier, payload_len);
+                
+                // Setup FC wait state BEFORE sending FF
+                // The RX task will set fc_received when it sees the FC frame
+                isotp_fc_state.waiting_for_fc = true;
+                isotp_fc_state.fc_received = false;
+                isotp_fc_state.fc_rx_id = can_frame.identifier;  // We expect FC from same ID (ECU response)
+                
+                // Send First Frame
+                // Use minimum 100ms timeout to ensure transmission completes
+                can_frame.self = 0; // Disable hardware loopback to avoid double echoes
+                uint32_t ff_timeout = (timeout > 0) ? timeout : 100;
+                esp_err_t send_result = can_send(&can_frame, pdMS_TO_TICKS(ff_timeout));
+                if (send_result != ESP_OK) {
+                    ESP_LOGE(TAG, "ISO15765 FF send FAILED: err=%d", send_result);
+                    isotp_fc_state.waiting_for_fc = false;
+                    continue;
+                }
+                
+                // Wait for Flow Control from ECU with timeout
+                // This is critical for proper ISO-TP operation
+                TickType_t fc_start = xTaskGetTickCount();
+                TickType_t fc_timeout = pdMS_TO_TICKS(timeout > 0 ? timeout : 1000);
+                uint8_t fc_stmin = ch->iso15765_stmin;
+                uint8_t fc_bs = 0;
+                
+                ESP_LOGI(TAG, "ISO15765: Waiting for FC from ECU...");
+                
+                while (!isotp_fc_state.fc_received) {
+                    TickType_t elapsed = xTaskGetTickCount() - fc_start;
+                    if (elapsed >= fc_timeout) {
+                        ESP_LOGW(TAG, "ISO15765: FC timeout! Sending CFs with default timing");
+                        // Don't fail - some ECUs are slow or don't send FC
+                        // Use default STmin
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+                
+                if (isotp_fc_state.fc_received) {
+                    // Handle FC flow status
+                    while (isotp_fc_state.fc_flow_status == 1) {
+                        // Wait status (FS=1) - ECU is busy, wait for CTS
+                        ESP_LOGI(TAG, "ISO15765: FC Wait received, waiting for CTS...");
+                        isotp_fc_state.fc_received = false;  // Clear to wait for next FC
+                        
+                        TickType_t wait_start = xTaskGetTickCount();
+                        while (!isotp_fc_state.fc_received) {
+                            if ((xTaskGetTickCount() - wait_start) >= fc_timeout) {
+                                ESP_LOGW(TAG, "ISO15765: FC CTS timeout after Wait");
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(1));
+                        }
+                        
+                        if (!isotp_fc_state.fc_received) break;
+                    }
+                    
+                    if (isotp_fc_state.fc_flow_status == 2) {
+                        // Overflow (FS=2) - abort
+                        ESP_LOGE(TAG, "ISO15765: FC Overflow received, aborting");
+                        isotp_fc_state.waiting_for_fc = false;
+                        continue;
+                    }
+                    
+                    fc_stmin = isotp_fc_state.fc_stmin;
+                    fc_bs = isotp_fc_state.fc_block_size;
+                    ESP_LOGI(TAG, "ISO15765: FC received, BS=%d STmin=%d", fc_bs, fc_stmin);
+                }
+                
+                isotp_fc_state.waiting_for_fc = false;
+                
+                // Send Consecutive Frames
+                uint32_t remaining = payload_len - 6;
+                uint32_t offset = 6;
+                uint8_t seq_num = 1;
+                uint8_t block_count = 0;
+                
+                while (remaining > 0) {
+                    // Check if we need to wait for another FC (block size reached)
+                    if (fc_bs > 0 && block_count >= fc_bs) {
+                        ESP_LOGI(TAG, "ISO15765: Block size %d reached, waiting for FC", fc_bs);
+                        isotp_fc_state.waiting_for_fc = true;
+                        isotp_fc_state.fc_received = false;
+                        
+                        TickType_t bs_start = xTaskGetTickCount();
+                        while (!isotp_fc_state.fc_received) {
+                            if ((xTaskGetTickCount() - bs_start) >= fc_timeout) {
+                                ESP_LOGW(TAG, "ISO15765: FC timeout after block");
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(1));
+                        }
+                        
+                        if (isotp_fc_state.fc_received) {
+                            // Handle Wait status in block mode
+                            while (isotp_fc_state.fc_flow_status == 1) {
+                                ESP_LOGI(TAG, "ISO15765: FC Wait in block, waiting for CTS...");
+                                isotp_fc_state.fc_received = false;
+                                
+                                TickType_t wait_start = xTaskGetTickCount();
+                                while (!isotp_fc_state.fc_received) {
+                                    if ((xTaskGetTickCount() - wait_start) >= fc_timeout) {
+                                        ESP_LOGW(TAG, "ISO15765: FC CTS timeout in block");
+                                        break;
+                                    }
+                                    vTaskDelay(pdMS_TO_TICKS(1));
+                                }
+                                if (!isotp_fc_state.fc_received) break;
+                            }
+                            
+                            if (isotp_fc_state.fc_flow_status == 2) {
+                                ESP_LOGE(TAG, "ISO15765: FC Overflow in block, aborting");
+                                isotp_fc_state.waiting_for_fc = false;
+                                break;
+                            }
+                            
+                            // Update STmin from this FC (ECU may change it between blocks)
+                            fc_stmin = isotp_fc_state.fc_stmin;
+                            ESP_LOGI(TAG, "ISO15765: Block FC received, new STmin=%d", fc_stmin);
+                        }
+                        
+                        isotp_fc_state.waiting_for_fc = false;
+                        block_count = 0;
+                    }
+                    
+                    memset(&can_frame, 0, sizeof(can_frame));
+                    // Use msg_data_ptr for CAN ID (supports ext_data for large messages)
+                    can_frame.identifier = (msg_data_ptr[0] << 24) | 
+                                          (msg_data_ptr[1] << 16) |
+                                          (msg_data_ptr[2] << 8) | 
+                                          msg_data_ptr[3];
+                    if (!(msgs[i].tx_flags & J2534_CAN_29BIT_ID)) {
+                        can_frame.identifier &= 0x7FF;
+                    }
+                    can_frame.extd = (msgs[i].tx_flags & J2534_CAN_29BIT_ID) ? 1 : 0;
+                    
+                    // CF PCI: 0x2N where N is sequence number (0-F, wraps)
+                    can_frame.data[0] = 0x20 | (seq_num & 0x0F);
+                    uint32_t cf_len = (remaining > 7) ? 7 : remaining;
+                    memcpy(&can_frame.data[1], &payload[offset], cf_len);
+                    can_frame.data_length_code = 1 + cf_len;
+                    
+                    if (use_padding && can_frame.data_length_code < 8) {
+                        memset(&can_frame.data[can_frame.data_length_code], 0xAA,
+                               8 - can_frame.data_length_code);
+                        can_frame.data_length_code = 8;
+                    }
+                    
+                    can_frame.self = 0; // Disable hardware loopback
+                    // Use minimum 100ms timeout for CF sends to ensure queue doesn't overflow
+                    // The J2534 timeout of 0 means "no timeout" but we need to wait for queue space
+                    uint32_t cf_timeout = (timeout > 0) ? timeout : 100;
+                    send_result = can_send(&can_frame, pdMS_TO_TICKS(cf_timeout));
+                    if (send_result != ESP_OK) {
+                        ESP_LOGE(TAG, "ISO15765 CF[%d] send FAILED: err=%d", seq_num, send_result);
+                        break;
+                    }
+                    
+                    ESP_LOGI(TAG, "ISO15765 CF[%d]: len=%lu", seq_num, cf_len);
+                    
+                    offset += cf_len;
+                    remaining -= cf_len;
+                    seq_num = (seq_num + 1) & 0x0F;
+                    block_count++;
+                    
+                    // Inter-frame delay (STmin from FC)
+                    // Precise timing is critical for programming operations
+                    if (remaining > 0 && fc_stmin > 0) {
+                        if (fc_stmin <= 0x7F) {
+                            // 0x00-0x7F: STmin in milliseconds
+                            if (fc_stmin == 0) {
+                                // STmin=0 means send as fast as possible, but give scheduler a chance
+                                taskYIELD();
+                            } else {
+                                vTaskDelay(pdMS_TO_TICKS(fc_stmin));
+                            }
+                        } else if (fc_stmin >= 0xF1 && fc_stmin <= 0xF9) {
+                            // 0xF1-0xF9: STmin in 100us units (100us - 900us)
+                            // Use ROM delay for microsecond precision
+                            uint32_t us_delay = (fc_stmin - 0xF0) * 100;
+                            esp_rom_delay_us(us_delay);
+                        } else if (fc_stmin >= 0x80 && fc_stmin <= 0xF0) {
+                            // Reserved values - treat as 0x7F (127ms) per ISO 15765-2
+                            vTaskDelay(pdMS_TO_TICKS(127));
+                        }
+                    } else if (remaining > 0) {
+                        // Default: yield to scheduler but don't add delay
+                        taskYIELD();
+                    }
+                }
+                
+                // CRITICAL: Wait for CAN TX queue to drain before returning
+                // This ensures all CAN frames are actually transmitted on the wire
+                // Without this, twai_transmit() just queues frames and returns immediately
+                // which can cause the ECU to receive an incomplete ISO-TP message
+                {
+                    twai_status_info_t status_info;
+                    TickType_t drain_start = xTaskGetTickCount();
+                    TickType_t drain_timeout = pdMS_TO_TICKS(5000);  // 5 second max wait
+                    
+                    ESP_LOGI(TAG, "ISO15765: Waiting for TX queue to drain...");
+                    
+                    while (1) {
+                        twai_get_status_info(&status_info);
+                        if (status_info.msgs_to_tx == 0) {
+                            ESP_LOGI(TAG, "ISO15765: TX queue drained, all frames sent");
+                            break;
+                        }
+                        if ((xTaskGetTickCount() - drain_start) >= drain_timeout) {
+                            ESP_LOGW(TAG, "ISO15765: TX drain timeout, %lu msgs still pending", 
+                                     status_info.msgs_to_tx);
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(1));  // Small delay to avoid busy-wait
+                    }
+                }
+                
+                // Buffer TX indication for ISO-TP multi-frame message
+                // This echoes the original message back with TX_MSG_TYPE flag
+                // J2534-2: TX echoes are ALWAYS generated to confirm transmission
+                j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+                
+                // Mark that we've completed a large ISO-TP TX and are awaiting ECU response
+                // This implements extended wait behavior for programming operations
+                // where ECU responses can take 1-5+ seconds after large TransferData (0x36)
+                isotp_tx_state.awaiting_response = true;
+                isotp_tx_state.tx_complete_time = xTaskGetTickCount();
+                // Calculate expected response CAN ID (usually TX_ID + 8)
+                isotp_tx_state.response_can_id = can_frame.identifier + 8;
+                ESP_LOGI(TAG, "ISO15765: Multi-frame TX complete, awaiting response on 0x%lX",
+                         isotp_tx_state.response_can_id);
+                
+                sent_count++;
+                continue;  // Skip the normal send below
+            }
+        } else {
+            // Raw CAN - just copy data directly
+            if (payload_len > 8) payload_len = 8;
+            can_frame.data_length_code = payload_len;
+            memcpy(can_frame.data, payload, payload_len);
+        }
+        
+        // Set loopback if needed
+        can_frame.self = 0; // Disable hardware loopback to avoid double echoes
+        
+        // Send frame with minimum 100ms timeout to ensure queue space
+        uint32_t send_timeout = (timeout > 0) ? timeout : 100;
+        esp_err_t send_result = can_send(&can_frame, pdMS_TO_TICKS(send_timeout));
+        if (send_result == ESP_OK) {
+            sent_count++;
+            ESP_LOGI(TAG, "CAN send OK: ID=0x%lX, len=%d, data=%02X %02X %02X %02X %02X %02X %02X %02X", 
+                     can_frame.identifier, can_frame.data_length_code,
+                     can_frame.data[0], can_frame.data[1], can_frame.data[2], can_frame.data[3],
+                     can_frame.data[4], can_frame.data[5], can_frame.data[6], can_frame.data[7]);
+            
+            // Buffer TX indication (echo) - J2534-2 requires echoing TX messages back
+            // with RxStatus=0x01 to confirm successful transmission
+            // This is critical for subnet discovery
+            // TX echoes are ALWAYS generated regardless of LOOPBACK setting
+            j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+        } else {
+            ESP_LOGE(TAG, "CAN send FAILED: err=%d, ID=0x%lX", 
+                     send_result, can_frame.identifier);
+        }
+    }
+    
+    *num_msgs = sent_count;
+    return J2534_STATUS_NOERROR;
+}
+
+/* ============================================================================
+ * IOCTL
+ * ============================================================================ */
+
+j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
+                          void *input, void *output)
+{
+    j2534_channel_t *ch = NULL;
+    
+    // Some IOCTLs don't need a valid channel
+    if (ioctl_id != J2534_IOCTL_READ_VBATT && 
+        ioctl_id != J2534_IOCTL_READ_PROG_VOLTAGE) {
+        ch = j2534_get_channel(channel_id);
+        if (!ch) {
+            j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
+            return J2534_ERR_INVALID_CHANNEL_ID;
+        }
+    }
+    
+    switch (ioctl_id) {
+        case J2534_IOCTL_GET_CONFIG:
+            if (!input || !output) {
+                return J2534_ERR_NULL_PARAMETER;
+            }
+            // Handle GET_CONFIG
+            {
+                j2534_sconfig_list_t *list = (j2534_sconfig_list_t *)input;
+                for (uint32_t i = 0; i < list->num_of_params; i++) {
+                    switch (list->config_ptr[i].parameter) {
+                        case J2534_CONFIG_DATA_RATE:
+                            list->config_ptr[i].value = ch->baudrate;
+                            break;
+                        case J2534_CONFIG_LOOPBACK:
+                            list->config_ptr[i].value = ch->loopback ? 1 : 0;
+                            break;
+                        case J2534_CONFIG_ISO15765_BS:
+                            list->config_ptr[i].value = ch->iso15765_bs;
+                            break;
+                        case J2534_CONFIG_ISO15765_STMIN:
+                            list->config_ptr[i].value = ch->iso15765_stmin;
+                            break;
+                        default:
+                            list->config_ptr[i].value = 0;
+                            break;
+                    }
+                }
+            }
+            break;
+            
+        case J2534_IOCTL_SET_CONFIG:
+            if (!input) {
+                return J2534_ERR_NULL_PARAMETER;
+            }
+            {
+                j2534_sconfig_list_t *list = (j2534_sconfig_list_t *)input;
+                for (uint32_t i = 0; i < list->num_of_params; i++) {
+                    switch (list->config_ptr[i].parameter) {
+                        case J2534_CONFIG_DATA_RATE:
+                            ch->baudrate = list->config_ptr[i].value;
+                            can_disable();
+                            can_set_bitrate(j2534_baudrate_to_can(ch->baudrate));
+                            can_enable();
+                            break;
+                        case J2534_CONFIG_LOOPBACK:
+                            ch->loopback = list->config_ptr[i].value ? true : false;
+                            if (ch->active) {
+                                can_disable();
+                                can_set_loopback(ch->loopback ? 1 : 0);
+                                can_enable();
+                            }
+                            break;
+                        case J2534_CONFIG_ISO15765_BS:
+                            ch->iso15765_bs = list->config_ptr[i].value;
+                            break;
+                        case J2534_CONFIG_ISO15765_STMIN:
+                            ch->iso15765_stmin = list->config_ptr[i].value;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            break;
+            
+        case J2534_IOCTL_READ_VBATT:
+            if (output) {
+                // Return voltage in mV (placeholder - needs actual implementation)
+                *((uint32_t *)output) = 12000;  // 12V
+            }
+            break;
+            
+        case J2534_IOCTL_CLEAR_TX_BUFFER:
+            // Nothing to do - we don't buffer TX
+            break;
+            
+        case J2534_IOCTL_CLEAR_RX_BUFFER:
+            j2534_rx_msg_head = 0;
+            j2534_rx_msg_tail = 0;
+            break;
+            
+        case J2534_IOCTL_CLEAR_MSG_FILTERS:
+            if (ch) {
+                memset(ch->filters, 0, sizeof(ch->filters));
+                ch->filter_count = 0;
+            }
+            break;
+        
+        case J2534_IOCTL_CLEAR_PERIODIC_MSGS:
+            // Clear all periodic messages for this channel
+            {
+                int cleared = 0;
+                for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
+                    if (j2534_periodic_msgs[i].active && j2534_periodic_msgs[i].channel_id == channel_id) {
+                        j2534_periodic_msgs[i].active = false;
+                        cleared++;
+                    }
+                }
+                ESP_LOGI(TAG, "IOCTL: CLEAR_PERIODIC_MSGS - cleared %d messages for channel %lu", cleared, channel_id);
+            }
+            break;
+            
+        case J2534_IOCTL_CLEAR_FUNCT_MSG_LOOKUP_TABLE:
+            // Clear functional message lookup table - used for functional addressing
+            if (ch) {
+                memset(ch->funct_msg_table, 0, sizeof(ch->funct_msg_table));
+                ch->funct_msg_count = 0;
+                ESP_LOGI(TAG, "IOCTL: CLEAR_FUNCT_MSG_LOOKUP_TABLE - cleared");
+            }
+            break;
+            
+        case J2534_IOCTL_ADD_TO_FUNCT_MSG_LOOKUP_TABLE:
+            // Add CAN IDs to functional message lookup table
+            // Input format: array of CAN IDs to accept for functional addressing
+            // Diagnostic software uses this to register which ECU response IDs to accept
+            if (ch && input) {
+                uint8_t *data = (uint8_t *)input;
+                uint32_t num_ids = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+                ESP_LOGI(TAG, "IOCTL: ADD_TO_FUNCT_MSG_LOOKUP_TABLE - adding %lu IDs", num_ids);
+                
+                for (uint32_t i = 0; i < num_ids && ch->funct_msg_count < J2534_MAX_FUNCT_MSG_IDS; i++) {
+                    uint32_t offset = 4 + (i * 4);
+                    uint32_t can_id = (data[offset] << 24) | (data[offset+1] << 16) | 
+                                     (data[offset+2] << 8) | data[offset+3];
+                    
+                    // Check if already in table
+                    bool found = false;
+                    for (uint32_t j = 0; j < J2534_MAX_FUNCT_MSG_IDS; j++) {
+                        if (ch->funct_msg_table[j].active && ch->funct_msg_table[j].can_id == can_id) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!found) {
+                        // Find empty slot
+                        for (uint32_t j = 0; j < J2534_MAX_FUNCT_MSG_IDS; j++) {
+                            if (!ch->funct_msg_table[j].active) {
+                                ch->funct_msg_table[j].can_id = can_id;
+                                ch->funct_msg_table[j].active = true;
+                                ch->funct_msg_count++;
+                                ESP_LOGI(TAG, "  Added functional ID: 0x%lX", can_id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case J2534_IOCTL_DELETE_FROM_FUNCT_MSG_LOOKUP_TABLE:
+            // Delete CAN IDs from functional message lookup table
+            if (ch && input) {
+                uint8_t *data = (uint8_t *)input;
+                uint32_t num_ids = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+                ESP_LOGI(TAG, "IOCTL: DELETE_FROM_FUNCT_MSG_LOOKUP_TABLE - removing %lu IDs", num_ids);
+                
+                for (uint32_t i = 0; i < num_ids; i++) {
+                    uint32_t offset = 4 + (i * 4);
+                    uint32_t can_id = (data[offset] << 24) | (data[offset+1] << 16) | 
+                                     (data[offset+2] << 8) | data[offset+3];
+                    
+                    for (uint32_t j = 0; j < J2534_MAX_FUNCT_MSG_IDS; j++) {
+                        if (ch->funct_msg_table[j].active && ch->funct_msg_table[j].can_id == can_id) {
+                            ch->funct_msg_table[j].active = false;
+                            ch->funct_msg_count--;
+                            ESP_LOGI(TAG, "  Removed functional ID: 0x%lX", can_id);
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+            
+#if HARDWARE_VER == WICAN_PRO
+        case J2534_IOCTL_FIVE_BAUD_INIT:
+            // 5-baud initialization for ISO9141/ISO14230
+            // Input: pointer to SBYTE_ARRAY with target address
+            // Output: 2 key bytes from ECU
+            if (ch && j2534_is_legacy_protocol(ch->protocol_id)) {
+                uint8_t target_addr = 0x33;  // Default address
+                uint8_t key_bytes[2] = {0};
+                
+                if (input) {
+                    uint8_t *data = (uint8_t *)input;
+                    // Input format: [NumBytes][Bytes...]
+                    if (data[0] >= 1) {
+                        target_addr = data[1];
+                    }
+                }
+                
+                ESP_LOGI(TAG, "IOCTL: FIVE_BAUD_INIT to addr 0x%02X", target_addr);
+                
+                stn_j2534_status_t status = stn_j2534_five_baud_init(target_addr, key_bytes);
+                
+                if (status == STN_J2534_STATUS_OK) {
+                    // Return key bytes in output
+                    if (output) {
+                        uint8_t *out = (uint8_t *)output;
+                        out[0] = 2;  // NumBytes
+                        out[1] = key_bytes[0];
+                        out[2] = key_bytes[1];
+                    }
+                    ESP_LOGI(TAG, "FIVE_BAUD_INIT success: KB1=0x%02X, KB2=0x%02X", 
+                             key_bytes[0], key_bytes[1]);
+                } else {
+                    ESP_LOGE(TAG, "FIVE_BAUD_INIT failed: status=%d", status);
+                    return J2534_ERR_FAILED;
+                }
+            } else {
+                ESP_LOGW(TAG, "FIVE_BAUD_INIT not supported for this protocol");
+                return J2534_ERR_NOT_SUPPORTED;
+            }
+            break;
+            
+        case J2534_IOCTL_FAST_INIT:
+            // Fast initialization for ISO14230
+            // Input/Output: pointer to PASSTHRU_MSG with WakeupMsg/InitResp
+            if (ch && (ch->protocol_id == J2534_PROTOCOL_ISO14230 || 
+                       ch->protocol_id == J2534_PROTOCOL_ISO14230_PS)) {
+                ESP_LOGI(TAG, "IOCTL: FAST_INIT");
+                
+                stn_j2534_status_t status = stn_j2534_fast_init();
+                
+                if (status == STN_J2534_STATUS_OK) {
+                    ESP_LOGI(TAG, "FAST_INIT success");
+                } else {
+                    ESP_LOGE(TAG, "FAST_INIT failed: status=%d", status);
+                    return J2534_ERR_FAILED;
+                }
+            } else {
+                ESP_LOGW(TAG, "FAST_INIT not supported for this protocol");
+                return J2534_ERR_NOT_SUPPORTED;
+            }
+            break;
+#endif
+            
+        default:
+            ESP_LOGW(TAG, "Unsupported IOCTL ID: 0x%04lX", ioctl_id);
+            j2534_set_error(J2534_ERR_INVALID_IOCTL_ID, "Unsupported IOCTL");
+            return J2534_ERR_INVALID_IOCTL_ID;
+    }
+    
+    return J2534_STATUS_NOERROR;
+}
+
+/* ============================================================================
+ * CAN Frame Conversion
+ * ============================================================================ */
+
+/* ============================================================================
+ * ISO-TP Helper Functions
+ * ============================================================================ */
+
+static uint32_t isotp_get_flow_control_id(j2534_channel_t *ch, uint32_t rx_id)
+{
+    // Look for a flow control filter that matches this RX ID
+    for (uint32_t i = 0; i < J2534_MAX_FILTERS; i++) {
+        if (!ch->filters[i].active) continue;
+        if (ch->filters[i].filter_type != J2534_FILTER_FLOW_CONTROL) continue;
+        
+        // Check if pattern matches this RX ID
+        uint32_t pattern = (ch->filters[i].pattern[0] << 24) |
+                          (ch->filters[i].pattern[1] << 16) |
+                          (ch->filters[i].pattern[2] << 8) |
+                          ch->filters[i].pattern[3];
+        
+        uint32_t mask = (ch->filters[i].mask[0] << 24) |
+                       (ch->filters[i].mask[1] << 16) |
+                       (ch->filters[i].mask[2] << 8) |
+                       ch->filters[i].mask[3];
+        
+        if ((rx_id & mask) == (pattern & mask)) {
+            // Return the flow control ID
+            uint32_t fc_id = (ch->filters[i].flow_control[0] << 24) |
+                            (ch->filters[i].flow_control[1] << 16) |
+                            (ch->filters[i].flow_control[2] << 8) |
+                            ch->filters[i].flow_control[3];
+            return fc_id;
+        }
+    }
+    
+    // Default: standard OBD-II response ID mapping
+    // RX 0x7E8-0x7EF -> TX 0x7E0-0x7E7
+    if (rx_id >= 0x7E8 && rx_id <= 0x7EF) {
+        return rx_id - 8;
+    }
+    
+    return rx_id - 8;  // Default assumption
+}
+
+static void isotp_send_flow_control(j2534_channel_t *ch, uint32_t tx_id, bool is_extended)
+{
+    twai_message_t fc_frame;
+    memset(&fc_frame, 0, sizeof(fc_frame));
+    
+    fc_frame.identifier = tx_id;
+    fc_frame.extd = is_extended ? 1 : 0;
+    fc_frame.data_length_code = 8;
+    
+    // Flow Control: PCI=0x30, FS=0 (CTS), BS=0 (no limit), STmin
+    fc_frame.data[0] = 0x30;  // FC frame with CTS (Continue To Send)
+    fc_frame.data[1] = ch->iso15765_bs;  // Block Size (0 = no limit)
+    fc_frame.data[2] = ch->iso15765_stmin;  // STmin (default 10ms)
+    // Padding
+    fc_frame.data[3] = 0xAA;
+    fc_frame.data[4] = 0xAA;
+    fc_frame.data[5] = 0xAA;
+    fc_frame.data[6] = 0xAA;
+    fc_frame.data[7] = 0xAA;
+    
+    esp_err_t result = can_send(&fc_frame, pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "ISO-TP: Sent FC to 0x%lX, result=%d", tx_id, result);
+}
+
+static void isotp_buffer_complete_message(j2534_channel_t *ch, uint32_t can_id, 
+                                          uint8_t *data, uint32_t data_len, bool is_extended)
+{
+    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    if (next_head == j2534_rx_msg_tail) {
+        ESP_LOGW(TAG, "ISO-TP: RX buffer full!");
+        return;
+    }
+    
+    j2534_msg_t *msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+    memset(msg, 0, sizeof(j2534_msg_t));
+    
+    msg->protocol_id = ch->protocol_id;
+    msg->timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+    msg->rx_status = is_extended ? J2534_CAN_29BIT_ID : 0;
+    
+    // Put CAN ID in first 4 bytes
+    msg->data[0] = (can_id >> 24) & 0xFF;
+    msg->data[1] = (can_id >> 16) & 0xFF;
+    msg->data[2] = (can_id >> 8) & 0xFF;
+    msg->data[3] = can_id & 0xFF;
+    
+    // Copy reassembled data (without ISO-TP headers)
+    // Note: Most diagnostic responses fit in 252 bytes (256 - 4 for CAN ID)
+    // Programming TransferData responses may be larger but are segmented by ISO-TP
+    uint32_t copy_len = data_len;
+    if (copy_len > J2534_MAX_MSG_DATA_SIZE - 4) {
+        ESP_LOGW(TAG, "ISO-TP: Message truncated from %lu to %d bytes", 
+                 data_len, J2534_MAX_MSG_DATA_SIZE - 4);
+        copy_len = J2534_MAX_MSG_DATA_SIZE - 4;
+    }
+    memcpy(&msg->data[4], data, copy_len);
+    msg->data_size = 4 + copy_len;
+    
+    j2534_rx_msg_head = next_head;
+    ESP_LOGI(TAG, "ISO-TP: Complete message buffered, ID=0x%lX, len=%lu", can_id, copy_len);
+}
+
+int32_t j2534_can_to_msg(twai_message_t *frame, uint8_t *output_buf)
+{
+    if (!frame || !output_buf || !j2534_is_active()) {
+        return 0;
+    }
+    
+    j2534_channel_t *ch = j2534_get_channel(j2534_active_channel);
+    if (!ch) {
+        return 0;
+    }
+    
+    // Check if ISO15765 protocol - need ISO-TP handling
+    bool is_iso15765 = (ch->protocol_id == J2534_PROTOCOL_ISO15765 ||
+                       ch->protocol_id == J2534_PROTOCOL_ISO15765_PS ||
+                       ch->protocol_id == J2534_PROTOCOL_SW_ISO15765_PS);
+    
+    // Check if raw CAN protocol
+    bool is_raw_can = (ch->protocol_id == J2534_PROTOCOL_CAN ||
+                       ch->protocol_id == J2534_PROTOCOL_CAN_PS ||
+                       ch->protocol_id == J2534_PROTOCOL_SW_CAN_PS);
+    
+    // For raw CAN protocol: still apply PASS/BLOCK filters but skip ISO-TP processing.
+    // The DHP_Kepler reference means "accept all that pass filters" not "bypass filters".
+    // Diagnostic software sets up PASS filters for specific CAN ID ranges and expects
+    // only those messages to be returned, not background CAN traffic.
+    // NOTE: is_raw_can will skip ISO-TP handling below but still uses filter logic
+    
+    // Check filters - start with checking if frame passes any filter
+    // For ISO15765: if no PASS filters exist, default to passing all frames (let BLOCK filters reject)
+    bool has_pass_filter = false;
+    for (uint32_t i = 0; i < J2534_MAX_FILTERS; i++) {
+        if (ch->filters[i].active && ch->filters[i].filter_type != J2534_FILTER_BLOCK) {
+            has_pass_filter = true;
+            break;
+        }
+    }
+    
+    // Default: pass if no filters at all, or for ISO15765 if no PASS/FLOW_CONTROL filters
+    bool pass = (ch->filter_count == 0 && ch->funct_msg_count == 0);
+    
+    // Special handling for functional addressing (GMLAN subnet discovery)
+    // If last TX was to a functional address, be more permissive with RX filtering
+    bool functional_mode = (j2534_last_tx_id == 0x101 || j2534_last_tx_id == 0x10B ||
+                           j2534_last_tx_id == 0x7DF || 
+                           (j2534_last_tx_id >= 0x100 && j2534_last_tx_id <= 0x10F));
+    
+    // Special handling for ISO15765: be more permissive during subnet discovery
+    // If there are ONLY FLOW_CONTROL filters and the frame could be an ECU response, pass it
+    bool permissive_mode = false;
+    
+    ESP_LOGI(TAG, "j2534_can_to_msg: RX frame ID=0x%lX, DLC=%d, filter_count=%lu, funct_count=%lu, iso15765=%d, raw_can=%d, has_pass=%d, last_tx=0x%lX, func_mode=%d",
+             frame->identifier, frame->data_length_code, ch->filter_count, ch->funct_msg_count, is_iso15765, is_raw_can, has_pass_filter, j2534_last_tx_id, functional_mode);
+    
+    // Check PASS/FLOW_CONTROL filters
+    for (uint32_t i = 0; i < J2534_MAX_FILTERS && !pass; i++) {
+        if (!ch->filters[i].active) continue;
+        if (ch->filters[i].filter_type == J2534_FILTER_BLOCK) continue;
+        
+        uint32_t masked_id = frame->identifier;
+        uint32_t mask = (ch->filters[i].mask[0] << 24) |
+                        (ch->filters[i].mask[1] << 16) |
+                        (ch->filters[i].mask[2] << 8) |
+                        ch->filters[i].mask[3];
+        uint32_t pattern = (ch->filters[i].pattern[0] << 24) |
+                           (ch->filters[i].pattern[1] << 16) |
+                           (ch->filters[i].pattern[2] << 8) |
+                           ch->filters[i].pattern[3];
+        
+        ESP_LOGI(TAG, "  filter[%lu] type=%lu: ID=0x%lX & mask=0x%lX = 0x%lX, pattern=0x%lX, match=%d",
+                 i, ch->filters[i].filter_type, masked_id, mask, (masked_id & mask), (pattern & mask), 
+                 ((masked_id & mask) == (pattern & mask)));
+        
+        if ((masked_id & mask) == (pattern & mask)) {
+            pass = true;
+        }
+        
+        // For FLOW_CONTROL filters, also check if this could be a response from functional addressing
+        // GMLAN uses functional requests to 0x101 with responses from various ECU ranges
+        // OBD-II uses functional requests to 0x7DF with responses from 0x7E8-0x7EF
+        if (!pass && ch->filters[i].filter_type == J2534_FILTER_FLOW_CONTROL && is_iso15765) {
+            uint32_t fc_id = (ch->filters[i].flow_control[0] << 24) |
+                            (ch->filters[i].flow_control[1] << 16) |
+                            (ch->filters[i].flow_control[2] << 8) |
+                            ch->filters[i].flow_control[3];
+            
+            // GMLAN functional addressing patterns:
+            //   Functional Request ID 0x101 -> Responses from 0x1xx, 0x2xx, 0x5xx, 0x6xx, 0x7xx
+            //   OBD-II 0x7DF -> Responses from 0x7E8-0x7EF
+            // Be VERY permissive here - accept any ID that looks like it could be a valid response
+            bool is_functional_request = (fc_id == 0x101 || fc_id == 0x10B || fc_id == 0x7DF ||
+                                          (fc_id >= 0x100 && fc_id <= 0x1FF));
+            
+            // For GMLAN on HS-CAN, responses come from:
+            //   0x1xx range (ECU physical addresses)
+            //   0x2xx range (BCM, EBCM, etc.)
+            //   0x5xx range (Physical TX IDs)
+            //   0x6xx range (Physical RX IDs)
+            //   0x7xx range (Standard OBD range)
+            bool is_likely_response = (frame->identifier >= 0x100 && frame->identifier <= 0x7FF);
+            
+            if (is_functional_request && is_likely_response) {
+                ESP_LOGI(TAG, "  FLOW_CONTROL functional response: fc=0x%lX rx=0x%lX - PASS", fc_id, frame->identifier);
+                pass = true;
+                permissive_mode = true;
+            }
+        }
+    }
+    
+    // For ISO15765 with functional addressing (GMLAN subnet discovery):
+    // Accept all frames in valid ECU response range when last TX was to functional address.
+    // CRITICAL: Only use permissive mode if NO explicit PASS filters are configured!
+    // When explicit PASS filters are set, only matching frames should pass.
+    if (!pass && is_iso15765 && functional_mode && !has_pass_filter) {
+        // GMLAN ECU response ranges: 0x1xx, 0x2xx, 0x4xx, 0x5xx, 0x6xx, 0x7xx
+        bool is_likely_ecu_response = (frame->identifier >= 0x100 && frame->identifier <= 0x7FF);
+        if (is_likely_ecu_response) {
+            ESP_LOGI(TAG, "  ISO15765 functional mode: accepting ID=0x%lX (last_tx=0x%lX)", 
+                     frame->identifier, j2534_last_tx_id);
+            pass = true;
+            permissive_mode = true;
+        }
+    }
+    
+    // For ISO15765 with PHYSICAL addressing (normal ECU communication):
+    // Accept response from expected response ID (TX_ID + 8 for standard OBD-II)
+    // This is critical for Part 2 VIN writing where we TX to 0x7E0 and expect response from 0x7E8
+    // CRITICAL: Only use this fallback if NO explicit PASS filters are configured!
+    // When PASS filters exist (e.g., 0x7E8), those filters already handle matching.
+    if (!pass && is_iso15765 && j2534_last_tx_id != 0 && !has_pass_filter) {
+        // Standard OBD-II physical addressing: TX to 0x7E0-0x7E7, RX from 0x7E8-0x7EF
+        // Also handles GMLAN physical: TX to 0x2xx/0x5xx, RX from 0x6xx
+        uint32_t expected_rx_id = j2534_last_tx_id + 8;
+        
+        // Check if this frame's ID matches expected response
+        if (frame->identifier == expected_rx_id) {
+            ESP_LOGI(TAG, "  ISO15765 physical addressing: accepting ID=0x%lX (last_tx=0x%lX + 8)",
+                     frame->identifier, j2534_last_tx_id);
+            pass = true;
+        }
+        // Also check for ECU using TX-8 response pattern (some ECUs use this)
+        else if (j2534_last_tx_id >= 8 && frame->identifier == j2534_last_tx_id - 8) {
+            ESP_LOGI(TAG, "  ISO15765 physical addressing: accepting ID=0x%lX (last_tx=0x%lX - 8)",
+                     frame->identifier, j2534_last_tx_id);
+            pass = true;
+        }
+    }
+    
+    // Check functional message lookup table (for functional addressing / subnet discovery)
+    // This allows responses from any ECU when using broadcast addressing (0x7DF)
+    for (uint32_t i = 0; i < J2534_MAX_FUNCT_MSG_IDS && !pass; i++) {
+        if (!ch->funct_msg_table[i].active) continue;
+        
+        if (frame->identifier == ch->funct_msg_table[i].can_id) {
+            ESP_LOGI(TAG, "  FUNCT match: ID=0x%lX matches functional entry", frame->identifier);
+            pass = true;
+        }
+    }
+    
+    // Check block filters
+    for (uint32_t i = 0; i < J2534_MAX_FILTERS && pass; i++) {
+        if (!ch->filters[i].active) continue;
+        if (ch->filters[i].filter_type != J2534_FILTER_BLOCK) continue;
+        
+        uint32_t masked_id = frame->identifier;
+        uint32_t mask = (ch->filters[i].mask[0] << 24) |
+                        (ch->filters[i].mask[1] << 16) |
+                        (ch->filters[i].mask[2] << 8) |
+                        ch->filters[i].mask[3];
+        uint32_t pattern = (ch->filters[i].pattern[0] << 24) |
+                           (ch->filters[i].pattern[1] << 16) |
+                           (ch->filters[i].pattern[2] << 8) |
+                           ch->filters[i].pattern[3];
+        
+        if ((masked_id & mask) == (pattern & mask)) {
+            pass = false;
+        }
+    }
+    
+    if (!pass) {
+        ESP_LOGI(TAG, "j2534_can_to_msg: FILTERED OUT frame ID=0x%lX (permissive=%d)", 
+                 frame->identifier, permissive_mode);
+        return 0;
+    }
+    
+    // For raw CAN: skip ISO-TP processing and go directly to buffering
+    if (is_raw_can) {
+        ESP_LOGI(TAG, "j2534_can_to_msg: RAW CAN passed filters, buffering ID=0x%lX", frame->identifier);
+        goto buffer_message;
+    }
+    
+    // Handle ISO-TP framing if ISO15765 protocol
+    if (is_iso15765 && frame->data_length_code > 0) {
+        // Check for extended addressing mode:
+        // In extended addressing, first byte is the address (e.g., 0xF1, 0xFE)
+        // and second byte is the PCI. We detect this by checking:
+        // 1. If channel has extended addressing enabled, OR
+        // 2. If first byte looks like an address (high nibble >= 0xF) and second byte is valid PCI
+        uint8_t pci_offset = 0;
+        uint8_t ext_addr_byte = 0;
+        
+        if (ch->iso15765_ext_addr) {
+            // Channel explicitly configured for extended addressing
+            pci_offset = 1;
+            ext_addr_byte = frame->data[0];
+            ESP_LOGI(TAG, "ISO-TP: Using extended addressing (configured), ext_addr=0x%02X", ext_addr_byte);
+        } else if (frame->data_length_code >= 2) {
+            // Auto-detect extended addressing:
+            // If first byte has high nibble 0xF (like 0xF1, 0xFE) and second byte looks like valid SF PCI
+            uint8_t first_byte = frame->data[0];
+            uint8_t second_byte = frame->data[1];
+            uint8_t first_pci_type = (first_byte >> 4) & 0x0F;
+            uint8_t second_pci_type = (second_byte >> 4) & 0x0F;
+            
+            // Extended addressing detection heuristic:
+            // - First byte has invalid PCI type (0x4-0xF), AND
+            // - Second byte has valid PCI type (0x0-0x3)
+            if (first_pci_type >= 0x4 && second_pci_type <= 0x3) {
+                pci_offset = 1;
+                ext_addr_byte = first_byte;
+                // Remember this channel uses extended addressing
+                ch->iso15765_ext_addr = true;
+                ch->iso15765_ext_addr_byte = ext_addr_byte;
+                ESP_LOGI(TAG, "ISO-TP: Detected extended addressing, ext_addr=0x%02X", ext_addr_byte);
+            }
+        }
+        
+        uint8_t pci_type = (frame->data[pci_offset] >> 4) & 0x0F;
+        
+        switch (pci_type) {
+            case 0x0:  // Single Frame (SF)
+            {
+                uint8_t sf_dl = frame->data[pci_offset] & 0x0F;
+                if (sf_dl > 0 && sf_dl <= (7 - pci_offset)) {
+                    ESP_LOGI(TAG, "ISO-TP: SF received, len=%d, pci_offset=%d", sf_dl, pci_offset);
+                    
+                    // For extended addressing, include ext addr byte at start of data
+                    if (pci_offset > 0) {
+                        uint8_t temp_data[8];
+                        temp_data[0] = ext_addr_byte;  // Include extended address
+                        memcpy(&temp_data[1], &frame->data[pci_offset + 1], sf_dl);
+                        isotp_buffer_complete_message(ch, frame->identifier, 
+                                                      temp_data, sf_dl + 1, frame->extd);
+                    } else {
+                        isotp_buffer_complete_message(ch, frame->identifier, 
+                                                      &frame->data[1], sf_dl, frame->extd);
+                    }
+                }
+                return 0;
+            }
+            
+            case 0x1:  // First Frame (FF)
+            {
+                uint16_t ff_dl = ((frame->data[pci_offset] & 0x0F) << 8) | frame->data[pci_offset + 1];
+                ESP_LOGI(TAG, "ISO-TP: FF received, total_len=%d, pci_offset=%d", ff_dl, pci_offset);
+                
+                // If a multi-frame reception was already in progress, abort it
+                // This can happen if the previous transfer timed out or was interrupted
+                if (isotp_rx_state.active) {
+                    ESP_LOGW(TAG, "ISO-TP: New FF received while multi-frame in progress, aborting previous");
+                }
+                
+                // Get Flow Control TX ID first
+                uint32_t fc_tx_id = isotp_get_flow_control_id(ch, frame->identifier);
+                
+                // Initialize multi-frame reception
+                isotp_rx_state.active = true;
+                isotp_rx_state.can_id = frame->identifier;
+                isotp_rx_state.expected_length = ff_dl + pci_offset;  // Account for ext addr in length
+                isotp_rx_state.received_length = 0;
+                isotp_rx_state.next_seq_num = 1;
+                isotp_rx_state.is_extended = frame->extd;
+                isotp_rx_state.last_frame_time = xTaskGetTickCount();
+                isotp_rx_state.flow_control_id = fc_tx_id;
+                isotp_rx_state.block_size = ch->iso15765_bs;  // Use channel's configured BS
+                isotp_rx_state.block_count = 0;
+                
+                // Copy ext addr if present, then first 6 bytes of data
+                uint32_t copy_start = 0;
+                if (pci_offset > 0) {
+                    isotp_rx_state.data[0] = ext_addr_byte;
+                    copy_start = 1;
+                    isotp_rx_state.received_length = 1;
+                }
+                uint32_t ff_data_bytes = 6 - pci_offset;  // Fewer data bytes with ext addr
+                memcpy(&isotp_rx_state.data[copy_start], &frame->data[pci_offset + 2], ff_data_bytes);
+                isotp_rx_state.received_length += ff_data_bytes;
+                
+                // Send Flow Control to allow ECU to start sending CFs
+                isotp_send_flow_control(ch, fc_tx_id, frame->extd);
+                
+                return 0;
+            }
+            
+            case 0x2:  // Consecutive Frame (CF)
+            {
+                if (!isotp_rx_state.active) {
+                    ESP_LOGW(TAG, "ISO-TP: CF without active FF!");
+                    return 0;
+                }
+                
+                // Check for stale multi-frame reception (N_Cr timeout = 1000ms per ISO 15765-2)
+                // If too much time has passed since last frame, abort and accept new FF
+                TickType_t elapsed = xTaskGetTickCount() - isotp_rx_state.last_frame_time;
+                if (elapsed > pdMS_TO_TICKS(1000)) {
+                    ESP_LOGW(TAG, "ISO-TP: CF timeout (N_Cr), elapsed=%lu ms, aborting multi-frame RX",
+                             elapsed * portTICK_PERIOD_MS);
+                    isotp_rx_state.active = false;
+                    return 0;
+                }
+                
+                uint8_t seq_num = frame->data[pci_offset] & 0x0F;
+                if (seq_num != isotp_rx_state.next_seq_num) {
+                    ESP_LOGW(TAG, "ISO-TP: Seq mismatch! Expected %d, got %d", 
+                             isotp_rx_state.next_seq_num, seq_num);
+                    isotp_rx_state.active = false;
+                    return 0;
+                }
+                
+                // Calculate how many bytes in this CF
+                uint32_t remaining = isotp_rx_state.expected_length - isotp_rx_state.received_length;
+                uint32_t cf_data_len = (remaining > (7 - pci_offset)) ? (7 - pci_offset) : remaining;
+                
+                // Copy CF data
+                if (isotp_rx_state.received_length + cf_data_len <= sizeof(isotp_rx_state.data)) {
+                    memcpy(&isotp_rx_state.data[isotp_rx_state.received_length],
+                           &frame->data[pci_offset + 1], cf_data_len);
+                    isotp_rx_state.received_length += cf_data_len;
+                }
+                
+                isotp_rx_state.next_seq_num = (isotp_rx_state.next_seq_num + 1) & 0x0F;
+                isotp_rx_state.last_frame_time = xTaskGetTickCount();
+                isotp_rx_state.block_count++;
+                
+                ESP_LOGI(TAG, "ISO-TP: CF[%d], %lu/%lu bytes, block=%d/%d", 
+                         seq_num, isotp_rx_state.received_length, isotp_rx_state.expected_length,
+                         isotp_rx_state.block_count, isotp_rx_state.block_size);
+                
+                // Check if complete
+                if (isotp_rx_state.received_length >= isotp_rx_state.expected_length) {
+                    isotp_buffer_complete_message(ch, isotp_rx_state.can_id,
+                                                  isotp_rx_state.data, 
+                                                  isotp_rx_state.expected_length,
+                                                  isotp_rx_state.is_extended);
+                    isotp_rx_state.active = false;
+                }
+                // Check if we need to send another FC (block size reached, but not complete)
+                else if (isotp_rx_state.block_size > 0 && 
+                         isotp_rx_state.block_count >= isotp_rx_state.block_size) {
+                    ESP_LOGI(TAG, "ISO-TP: Block size %d reached, sending FC", isotp_rx_state.block_size);
+                    isotp_send_flow_control(ch, isotp_rx_state.flow_control_id, isotp_rx_state.is_extended);
+                    isotp_rx_state.block_count = 0;  // Reset for next block
+                }
+                
+                return 0;
+            }
+            
+            case 0x3:  // Flow Control (FC)
+            {
+                // We received FC from ECU - this means our multi-frame TX is acknowledged
+                uint8_t fc_fs = frame->data[pci_offset] & 0x0F;
+                uint8_t fc_bs = frame->data[pci_offset + 1];
+                uint8_t fc_stmin = frame->data[pci_offset + 2];
+                
+                ESP_LOGI(TAG, "ISO-TP: FC received, FS=%d, BS=%d, STmin=%d", fc_fs, fc_bs, fc_stmin);
+                
+                // If TX side is waiting for FC, signal it
+                if (isotp_fc_state.waiting_for_fc) {
+                    isotp_fc_state.fc_flow_status = fc_fs;
+                    isotp_fc_state.fc_block_size = fc_bs;
+                    isotp_fc_state.fc_stmin = fc_stmin;
+                    isotp_fc_state.fc_received = true;
+                    ESP_LOGI(TAG, "ISO-TP: FC signaled to TX task");
+                }
+                
+                // Don't buffer FC frames - they're internal protocol
+                return 0;
+            }
+            
+            default:
+                // Unknown PCI - buffer as raw CAN frame
+                ESP_LOGW(TAG, "ISO-TP: Unknown PCI type 0x%X, buffering as raw", pci_type);
+                break;
+        }
+    }
+    
+buffer_message:
+    // Non-ISO-TP or raw CAN - buffer as-is
+    ESP_LOGI(TAG, "j2534_can_to_msg: BUFFERED frame ID=0x%lX", frame->identifier);
+    
+    // Build J2534 message in RX buffer
+    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    if (next_head == j2534_rx_msg_tail) {
+        // Buffer full
+        ESP_LOGW(TAG, "j2534_can_to_msg: RX buffer full!");
+        return 0;
+    }
+    
+    j2534_msg_t *msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+    memset(msg, 0, sizeof(j2534_msg_t));
+    
+    msg->protocol_id = ch->protocol_id;
+    msg->timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+    msg->rx_status = 0;
+    
+    if (frame->extd) {
+        msg->rx_status |= J2534_CAN_29BIT_ID;
+    }
+    
+    // Put CAN ID in first 4 bytes
+    msg->data[0] = (frame->identifier >> 24) & 0xFF;
+    msg->data[1] = (frame->identifier >> 16) & 0xFF;
+    msg->data[2] = (frame->identifier >> 8) & 0xFF;
+    msg->data[3] = frame->identifier & 0xFF;
+    
+    // Copy data
+    memcpy(&msg->data[4], frame->data, frame->data_length_code);
+    msg->data_size = 4 + frame->data_length_code;
+    
+    j2534_rx_msg_head = next_head;
+    
+    // J2534 protocol: messages are buffered and retrieved via ReadMsgs command
+    // Do NOT send async/unsolicited messages - this breaks J2534 request/response model
+    // Return 0 to indicate no immediate data to send
+    return 0;
+}
+
+/* ============================================================================
+ * Protocol Processing
+ * ============================================================================ */
+
+static void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, 
+                                 twai_message_t *frame, QueueHandle_t *q)
+{
+    // Response buffer - sized for typical diagnostic responses
+    // Large ISO-TP messages handled via streaming
+    static uint8_t resp_data[512];
+    uint16_t resp_len = 0;
+    j2534_error_t status = J2534_STATUS_NOERROR;
+    
+    switch (cmd) {
+        case J2534_CMD_OPEN:
+        {
+            uint32_t dev_id;
+            status = j2534_open(&dev_id);
+            resp_data[0] = (dev_id >> 24) & 0xFF;
+            resp_data[1] = (dev_id >> 16) & 0xFF;
+            resp_data[2] = (dev_id >> 8) & 0xFF;
+            resp_data[3] = dev_id & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_CLOSE:
+        {
+            uint32_t dev_id = (data[0] << 24) | (data[1] << 16) | 
+                              (data[2] << 8) | data[3];
+            status = j2534_close(dev_id);
+            break;
+        }
+        
+        case J2534_CMD_CONNECT:
+        {
+            if (len < 16) {
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t dev_id = (data[0] << 24) | (data[1] << 16) | 
+                              (data[2] << 8) | data[3];
+            uint32_t protocol = (data[4] << 24) | (data[5] << 16) | 
+                                (data[6] << 8) | data[7];
+            uint32_t flags = (data[8] << 24) | (data[9] << 16) | 
+                             (data[10] << 8) | data[11];
+            uint32_t baud = (data[12] << 24) | (data[13] << 16) | 
+                            (data[14] << 8) | data[15];
+            uint32_t ch_id;
+            status = j2534_connect(dev_id, protocol, flags, baud, &ch_id);
+            resp_data[0] = (ch_id >> 24) & 0xFF;
+            resp_data[1] = (ch_id >> 16) & 0xFF;
+            resp_data[2] = (ch_id >> 8) & 0xFF;
+            resp_data[3] = ch_id & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_DISCONNECT:
+        {
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            status = j2534_disconnect(ch_id);
+            break;
+        }
+        
+        case J2534_CMD_START_PERIODIC_MSG:
+        {
+            ESP_LOGI(TAG, "CMD_START_PERIODIC_MSG: len=%u", len);
+            // Header: ch_id(4) + interval(4) + protocol_id(4) + tx_flags(4) + data_size(4) = 20 bytes minimum
+            if (len < 20) {
+                ESP_LOGE(TAG, "START_PERIODIC_MSG: len %u < 20", len);
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t interval = (data[4] << 24) | (data[5] << 16) | 
+                                (data[6] << 8) | data[7];
+            
+            // Parse message from data[8] onwards
+            j2534_msg_t msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.protocol_id = (data[8] << 24) | (data[9] << 16) | 
+                              (data[10] << 8) | data[11];
+            msg.tx_flags = (data[12] << 24) | (data[13] << 16) | 
+                           (data[14] << 8) | data[15];
+            msg.data_size = (data[16] << 24) | (data[17] << 16) | 
+                            (data[18] << 8) | data[19];
+            
+            if (msg.data_size > 0 && len >= 20 + msg.data_size) {
+                memcpy(msg.data, &data[20], msg.data_size);
+            }
+            
+            uint32_t msg_id;
+            status = j2534_start_periodic_msg(ch_id, &msg, interval, &msg_id);
+            resp_data[0] = (msg_id >> 24) & 0xFF;
+            resp_data[1] = (msg_id >> 16) & 0xFF;
+            resp_data[2] = (msg_id >> 8) & 0xFF;
+            resp_data[3] = msg_id & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_STOP_PERIODIC_MSG:
+        {
+            if (len < 8) {
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t msg_id = (data[4] << 24) | (data[5] << 16) | 
+                              (data[6] << 8) | data[7];
+            status = j2534_stop_periodic_msg(ch_id, msg_id);
+            break;
+        }
+        
+        case J2534_CMD_READ_MSGS:
+        {
+            if (len < 12) {
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t max_msgs = (data[4] << 24) | (data[5] << 16) | 
+                                (data[6] << 8) | data[7];
+            uint32_t timeout = (data[8] << 24) | (data[9] << 16) | 
+                               (data[10] << 8) | data[11];
+            
+            // Allocate buffer for messages
+            j2534_msg_t msgs[2];  // Read 1-2 messages at a time to fit in response buffer
+            uint32_t num_msgs = (max_msgs > 2) ? 2 : max_msgs;
+            
+            status = j2534_read_msgs(ch_id, msgs, &num_msgs, timeout);
+            
+            // Build response: num_msgs(4) + [protocol(4) + rx_status(4) + timestamp(4) + data_size(4) + extra(4) + data] for each
+            // Response buffer is 512 bytes, leave room for header
+            uint16_t max_resp = 500;
+            
+            resp_data[0] = (num_msgs >> 24) & 0xFF;
+            resp_data[1] = (num_msgs >> 16) & 0xFF;
+            resp_data[2] = (num_msgs >> 8) & 0xFF;
+            resp_data[3] = num_msgs & 0xFF;
+            resp_len = 4;
+            
+            for (uint32_t i = 0; i < num_msgs; i++) {
+                // Check if this message will fit
+                uint32_t msg_overhead = 20;  // 5 x 4-byte fields
+                if (resp_len + msg_overhead + msgs[i].data_size > max_resp) {
+                    ESP_LOGW(TAG, "READ_MSGS: Response too large, truncating at msg %lu", i);
+                    // Update num_msgs in response
+                    resp_data[0] = (i >> 24) & 0xFF;
+                    resp_data[1] = (i >> 16) & 0xFF;
+                    resp_data[2] = (i >> 8) & 0xFF;
+                    resp_data[3] = i & 0xFF;
+                    break;
+                }
+                
+                // Protocol ID (4 bytes)
+                resp_data[resp_len++] = (msgs[i].protocol_id >> 24) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].protocol_id >> 16) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].protocol_id >> 8) & 0xFF;
+                resp_data[resp_len++] = msgs[i].protocol_id & 0xFF;
+                // RX status (4 bytes)
+                resp_data[resp_len++] = (msgs[i].rx_status >> 24) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].rx_status >> 16) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].rx_status >> 8) & 0xFF;
+                resp_data[resp_len++] = msgs[i].rx_status & 0xFF;
+                // Timestamp (4 bytes)
+                resp_data[resp_len++] = (msgs[i].timestamp >> 24) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].timestamp >> 16) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].timestamp >> 8) & 0xFF;
+                resp_data[resp_len++] = msgs[i].timestamp & 0xFF;
+                // Data size (4 bytes)
+                resp_data[resp_len++] = (msgs[i].data_size >> 24) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].data_size >> 16) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].data_size >> 8) & 0xFF;
+                resp_data[resp_len++] = msgs[i].data_size & 0xFF;
+                // Extra data index (4 bytes) - MUST equal DataSize per J2534 spec
+                resp_data[resp_len++] = (msgs[i].data_size >> 24) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].data_size >> 16) & 0xFF;
+                resp_data[resp_len++] = (msgs[i].data_size >> 8) & 0xFF;
+                resp_data[resp_len++] = msgs[i].data_size & 0xFF;
+                // Data
+                memcpy(&resp_data[resp_len], msgs[i].data, msgs[i].data_size);
+                resp_len += msgs[i].data_size;
+            }
+            break;
+        }
+        
+        case J2534_CMD_WRITE_MSGS:
+        {
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS: len=%u", len);
+            if (len < 24) {
+                ESP_LOGE(TAG, "CMD_WRITE_MSGS: len < 24");
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t timeout = (data[4] << 24) | (data[5] << 16) | 
+                               (data[6] << 8) | data[7];
+            
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS: ch_id=%lu timeout=%lu", ch_id, timeout);
+            
+            // Parse message from data[8] onwards
+            j2534_msg_t msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.protocol_id = (data[8] << 24) | (data[9] << 16) | 
+                              (data[10] << 8) | data[11];
+            msg.tx_flags = (data[12] << 24) | (data[13] << 16) | 
+                           (data[14] << 8) | data[15];
+            msg.data_size = (data[16] << 24) | (data[17] << 16) | 
+                            (data[18] << 8) | data[19];
+            
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS: proto=%lu flags=%lu data_size=%lu", 
+                     msg.protocol_id, msg.tx_flags, msg.data_size);
+            
+            if (msg.data_size > 0 && len >= 20 + msg.data_size) {
+                // For large messages (e.g., programming data), use ext_data pointer
+                // to avoid buffer overflow. For small messages, copy to data[].
+                if (msg.data_size <= J2534_MAX_MSG_DATA_SIZE) {
+                    memcpy(msg.data, &data[20], msg.data_size);
+                    msg.ext_data = NULL;
+                } else {
+                    // Point directly to the packet data (avoid 4KB+ copy)
+                    msg.ext_data = &data[20];
+                    ESP_LOGI(TAG, "CMD_WRITE_MSGS: Using ext_data for large msg (%lu bytes)", msg.data_size);
+                }
+                ESP_LOGI(TAG, "CMD_WRITE_MSGS: CAN_ID=0x%02X%02X%02X%02X",
+                         data[20], data[21], data[22], data[23]);
+            }
+            
+            uint32_t num = 1;
+            status = j2534_write_msgs(ch_id, &msg, &num, timeout);
+            ESP_LOGI(TAG, "CMD_WRITE_MSGS: status=%d num=%lu", status, num);
+            resp_data[0] = (num >> 24) & 0xFF;
+            resp_data[1] = (num >> 16) & 0xFF;
+            resp_data[2] = (num >> 8) & 0xFF;
+            resp_data[3] = num & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_START_MSG_FILTER:
+        {
+            ESP_LOGI(TAG, "CMD_START_MSG_FILTER: len=%u", len);
+            if (len < 8) {
+                ESP_LOGE(TAG, "CMD_START_MSG_FILTER: len < 8");
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t filter_type = (data[4] << 24) | (data[5] << 16) | 
+                                   (data[6] << 8) | data[7];
+            
+            ESP_LOGI(TAG, "CMD_START_MSG_FILTER: ch_id=%lu filter_type=%lu len=%u", ch_id, filter_type, len);
+            
+            // Parse filter messages
+            j2534_msg_t mask_msg, pattern_msg, flow_ctrl_msg;
+            j2534_msg_t *flow_ctrl_ptr = NULL;
+            memset(&mask_msg, 0, sizeof(mask_msg));
+            memset(&pattern_msg, 0, sizeof(pattern_msg));
+            memset(&flow_ctrl_msg, 0, sizeof(flow_ctrl_msg));
+            
+            if (len >= 16) {
+                memcpy(mask_msg.data, &data[8], 4);
+                mask_msg.data_size = 4;
+                memcpy(pattern_msg.data, &data[12], 4);
+                pattern_msg.data_size = 4;
+                ESP_LOGI(TAG, "CMD_START_MSG_FILTER: mask=%02X%02X%02X%02X pattern=%02X%02X%02X%02X",
+                         data[8], data[9], data[10], data[11],
+                         data[12], data[13], data[14], data[15]);
+            }
+            
+            // For FLOW_CONTROL_FILTER (type 3), also parse flow control TX ID
+            if (filter_type == 3 && len >= 20) {
+                memcpy(flow_ctrl_msg.data, &data[16], 4);
+                flow_ctrl_msg.data_size = 4;
+                flow_ctrl_ptr = &flow_ctrl_msg;
+                ESP_LOGI(TAG, "CMD_START_MSG_FILTER: flow_ctrl=%02X%02X%02X%02X",
+                         data[16], data[17], data[18], data[19]);
+            }
+            
+            uint32_t filter_id;
+            status = j2534_start_msg_filter(ch_id, filter_type, 
+                                            &mask_msg, &pattern_msg, flow_ctrl_ptr, &filter_id);
+            ESP_LOGI(TAG, "CMD_START_MSG_FILTER: status=%d filter_id=%lu", status, filter_id);
+            resp_data[0] = (filter_id >> 24) & 0xFF;
+            resp_data[1] = (filter_id >> 16) & 0xFF;
+            resp_data[2] = (filter_id >> 8) & 0xFF;
+            resp_data[3] = filter_id & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_STOP_MSG_FILTER:
+        {
+            if (len < 8) {
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t filter_id = (data[4] << 24) | (data[5] << 16) | 
+                                 (data[6] << 8) | data[7];
+            status = j2534_stop_msg_filter(ch_id, filter_id);
+            break;
+        }
+        
+        case J2534_CMD_READ_VERSION:
+        {
+            char fw[32], dll[32], api[32];
+            status = j2534_read_version(j2534_device_id, fw, dll, api);
+            memcpy(&resp_data[0], fw, 32);
+            memcpy(&resp_data[32], dll, 32);
+            memcpy(&resp_data[64], api, 32);
+            resp_len = 96;
+            break;
+        }
+        
+        case J2534_CMD_IOCTL:
+        {
+            if (len < 8) {
+                status = J2534_ERR_INVALID_MSG;
+                break;
+            }
+            uint32_t ch_id = (data[0] << 24) | (data[1] << 16) | 
+                             (data[2] << 8) | data[3];
+            uint32_t ioctl_id = (data[4] << 24) | (data[5] << 16) | 
+                                (data[6] << 8) | data[7];
+            
+            uint32_t output_val = 0;
+            
+            if (ioctl_id == J2534_IOCTL_SET_CONFIG) {
+                // Special handling for SET_CONFIG serialization
+                if (len < 12) {
+                    status = J2534_ERR_INVALID_MSG;
+                    break;
+                }
+                uint32_t num_params = (data[8] << 24) | (data[9] << 16) | 
+                                      (data[10] << 8) | data[11];
+                
+                if (len < 12 + (num_params * 8)) {
+                    status = J2534_ERR_INVALID_MSG;
+                    break;
+                }
+                
+                j2534_sconfig_t *pairs = malloc(sizeof(j2534_sconfig_t) * num_params);
+                if (!pairs) {
+                    status = J2534_ERR_FAILED;
+                    break;
+                }
+                
+                for (uint32_t i = 0; i < num_params; i++) {
+                    uint32_t offset = 12 + (i * 8);
+                    pairs[i].parameter = (data[offset] << 24) | (data[offset+1] << 16) | 
+                                         (data[offset+2] << 8) | data[offset+3];
+                    pairs[i].value = (data[offset+4] << 24) | (data[offset+5] << 16) | 
+                                     (data[offset+6] << 8) | data[offset+7];
+                }
+                
+                j2534_sconfig_list_t list;
+                list.num_of_params = num_params;
+                list.config_ptr = pairs;
+                
+                status = j2534_ioctl(ch_id, ioctl_id, &list, &output_val);
+                free(pairs);
+            } else {
+                status = j2534_ioctl(ch_id, ioctl_id, &data[8], &output_val);
+            }
+            
+            resp_data[0] = (output_val >> 24) & 0xFF;
+            resp_data[1] = (output_val >> 16) & 0xFF;
+            resp_data[2] = (output_val >> 8) & 0xFF;
+            resp_data[3] = output_val & 0xFF;
+            resp_len = 4;
+            break;
+        }
+        
+        case J2534_CMD_GET_LAST_ERROR:
+        {
+            char err_desc[80];
+            j2534_get_last_error(err_desc);
+            memcpy(resp_data, err_desc, 80);
+            resp_len = 80;
+            break;
+        }
+        
+        default:
+            status = J2534_ERR_NOT_SUPPORTED;
+            break;
+    }
+    
+    j2534_send_response(cmd, status, resp_data, resp_len, q);
+}
+
+int8_t j2534_process(uint8_t *buf, uint32_t len, twai_message_t *frame, QueueHandle_t *q)
+{
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t byte = buf[i];
+        
+        switch (j2534_parse_state) {
+            case 0:  // Wait for SYNC1
+                if (byte == J2534_SYNC1) {
+                    j2534_rx_buffer[0] = byte;
+                    j2534_rx_index = 1;
+                    j2534_parse_state = 1;
+                }
+                break;
+                
+            case 1:  // Wait for SYNC2
+                if (byte == J2534_SYNC2) {
+                    j2534_rx_buffer[1] = byte;
+                    j2534_rx_index = 2;
+                    j2534_parse_state = 2;
+                } else {
+                    j2534_parse_state = 0;
+                }
+                break;
+                
+            case 2:  // Command byte
+                j2534_rx_buffer[j2534_rx_index++] = byte;
+                j2534_parse_state = 3;
+                break;
+                
+            case 3:  // Length high byte
+                j2534_rx_buffer[j2534_rx_index++] = byte;
+                j2534_expected_len = byte << 8;
+                j2534_parse_state = 4;
+                break;
+                
+            case 4:  // Length low byte
+                j2534_rx_buffer[j2534_rx_index++] = byte;
+                j2534_expected_len |= byte;
+                if (j2534_expected_len > J2534_MAX_PACKET_SIZE - 10) {
+                    j2534_parse_state = 0;
+                } else if (j2534_expected_len == 0) {
+                    j2534_parse_state = 6;  // Skip to checksum
+                } else {
+                    j2534_parse_state = 5;
+                }
+                break;
+                
+            case 5:  // Data bytes
+                j2534_rx_buffer[j2534_rx_index++] = byte;
+                if (j2534_rx_index >= 5 + j2534_expected_len) {
+                    j2534_parse_state = 6;
+                }
+                break;
+                
+            case 6:  // Checksum
+            {
+                uint8_t calc_cs = j2534_calc_checksum(j2534_rx_buffer, j2534_rx_index);
+                if (calc_cs == byte) {
+                    // Valid packet - process command
+                    uint8_t cmd = j2534_rx_buffer[2];
+                    j2534_handle_command(cmd, &j2534_rx_buffer[5], 
+                                         j2534_expected_len, frame, q);
+                } else {
+                    ESP_LOGW(TAG, "Checksum mismatch: expected %02X, got %02X", 
+                             calc_cs, byte);
+                }
+                j2534_parse_state = 0;
+                break;
+            }
+            
+            default:
+                j2534_parse_state = 0;
+                break;
+        }
+    }
+    
+    return 0;
+}

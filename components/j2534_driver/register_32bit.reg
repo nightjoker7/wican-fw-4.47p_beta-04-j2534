@@ -1,0 +1,13 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\PassThruSupport.04.04\WiCAN J2534]
+"Name"="WiCAN J2534"
+"Vendor"="WiCAN"
+"ConfigApplication"=""
+"FunctionLibrary"="C:\\Program Files\\WiCAN J2534\\wican_j2534_32.dll"
+"CAN"=dword:00000001
+"ISO15765"=dword:00000001
+"J1850VPW"=dword:00000001
+"J1850PWM"=dword:00000001
+"ISO9141"=dword:00000001
+"ISO14230"=dword:00000001

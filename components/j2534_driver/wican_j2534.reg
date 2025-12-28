@@ -1,0 +1,23 @@
+Windows Registry Editor Version 5.00
+
+; WiCAN J2534 Driver Registration
+; Run as Administrator to install
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\PassThruSupport.04.04\MeatPi - WiCAN]
+"Name"="MeatPi - WiCAN"
+"Vendor"="MeatPi Electronics"
+"ConfigApplication"=""
+"FunctionLibrary"="C:\\Program Files\\WiCAN\\wican_j2534_32.dll"
+"ProtocolsSupported"="CAN"
+"IPAddress"="192.168.0.24"
+"Port"=dword:00000d05
+
+; 32-bit registry (for 64-bit Windows running 32-bit apps)
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\PassThruSupport.04.04\MeatPi - WiCAN]
+"Name"="MeatPi - WiCAN"
+"Vendor"="MeatPi Electronics"
+"ConfigApplication"=""
+"FunctionLibrary"="C:\\Program Files\\WiCAN\\wican_j2534_32.dll"
+"ProtocolsSupported"="CAN"
+"IPAddress"="192.168.0.24"
+"Port"=dword:00000d05
