@@ -51,7 +51,9 @@ static const twai_timing_config_t twai_timing_config[] = {
 	{.brp = 400, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},  // CAN_10K: 10 kbps
 	{.brp = 200, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},  // CAN_20K: 20 kbps
 	{.brp = 128, .tseg_1 = 16, .tseg_2 = 8, .sjw = 3, .triple_sampling = false},  // CAN_25K: 25 kbps
+	{.brp = 120, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},  // CAN_33K: 33.3 kbps (SWCAN/GMLAN normal)
 	{.brp = 80, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},   // CAN_50K: 50 kbps
+	{.brp = 48, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},   // CAN_83K: 83.3 kbps (SWCAN/GMLAN high-speed)
 	{.brp = 40, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},   // CAN_100K: 100 kbps
 	{.brp = 32, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},   // CAN_125K: 125 kbps
 	{.brp = 16, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false},   // CAN_250K: 250 kbps

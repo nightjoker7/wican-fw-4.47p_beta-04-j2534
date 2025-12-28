@@ -51,6 +51,7 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
     // Validate protocol and determine if CAN or legacy (via OBD chip)
     uint32_t base_protocol = protocol_id;
     bool is_legacy_protocol = false;
+    bool is_swcan = false;  // Single-Wire CAN (GMLAN)
     stn_protocol_t stn_proto = STN_PROTO_AUTO;
 
     switch (protocol_id) {
@@ -61,18 +62,32 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
 
         // J2534-2 Extended CAN protocols - map to CAN
         case J2534_PROTOCOL_CAN_PS:
-        case J2534_PROTOCOL_SW_CAN_PS:
         case J2534_PROTOCOL_CAN_CH1:
         case J2534_PROTOCOL_CAN_CH2:
             base_protocol = J2534_PROTOCOL_CAN;
             ESP_LOGI(TAG, "Mapping extended protocol 0x%04lX to CAN", protocol_id);
             break;
 
+        // Single-Wire CAN (GMLAN) - default 33.3 kbps
+        case J2534_PROTOCOL_SW_CAN_PS:
+            base_protocol = J2534_PROTOCOL_CAN;
+            is_swcan = true;
+            if (baudrate == 0) baudrate = 33333;  // Default SWCAN baud rate
+            ESP_LOGI(TAG, "SWCAN (GMLAN) protocol, baud=%lu", baudrate);
+            break;
+
         // J2534-2 Extended ISO15765 protocols - map to ISO15765
         case J2534_PROTOCOL_ISO15765_PS:
-        case J2534_PROTOCOL_SW_ISO15765_PS:
             base_protocol = J2534_PROTOCOL_ISO15765;
             ESP_LOGI(TAG, "Mapping extended protocol 0x%04lX to ISO15765", protocol_id);
+            break;
+
+        // Single-Wire CAN ISO15765 (GMLAN with ISO-TP)
+        case J2534_PROTOCOL_SW_ISO15765_PS:
+            base_protocol = J2534_PROTOCOL_ISO15765;
+            is_swcan = true;
+            if (baudrate == 0) baudrate = 33333;  // Default SWCAN baud rate
+            ESP_LOGI(TAG, "SWCAN ISO15765 (GMLAN ISO-TP), baud=%lu", baudrate);
             break;
 
 #if HARDWARE_VER == WICAN_PRO
@@ -174,6 +189,7 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
 
     // Suppress unused variable warning when not on PRO
     (void)is_legacy_protocol;
+    (void)is_swcan;
     (void)stn_proto;
     (void)base_protocol;
 

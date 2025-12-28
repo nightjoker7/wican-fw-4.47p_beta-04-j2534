@@ -151,7 +151,9 @@ uint32_t j2534_baudrate_to_can(uint32_t baudrate)
         case 10000:  return CAN_10K;
         case 20000:  return CAN_20K;
         case 25000:  return CAN_25K;
+        case 33333:  return CAN_33K;   // SWCAN / GMLAN normal-speed
         case 50000:  return CAN_50K;
+        case 83333:  return CAN_83K;   // SWCAN / GMLAN high-speed
         case 100000: return CAN_100K;
         case 125000: return CAN_125K;
         case 250000: return CAN_250K;

@@ -27,14 +27,16 @@
 #define CAN_10K				1
 #define CAN_20K				2
 #define CAN_25K				3
-#define CAN_50K				4
-#define CAN_100K			5
-#define CAN_125K			6
-#define CAN_250K			7
-#define CAN_500K			8
-#define CAN_800K			9
-#define CAN_1000K			10
-#define CAN_AUTO			11
+#define CAN_33K				4   // SWCAN / GMLAN normal-speed (33.3 kbps)
+#define CAN_50K				5
+#define CAN_83K				6   // SWCAN / GMLAN high-speed (83.3 kbps)
+#define CAN_100K			7
+#define CAN_125K			8
+#define CAN_250K			9
+#define CAN_500K			10
+#define CAN_800K			11
+#define CAN_1000K			12
+#define CAN_AUTO			13
 typedef struct {
 	uint8_t bus_state;
 	uint8_t silent;

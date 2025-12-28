@@ -259,6 +259,36 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
             break;
 #endif
 
+        // SWCAN High-Speed Mode (switch from 33.3K to 83.3K)
+        case J2534_IOCTL_SW_CAN_HS:
+            if (ch && (ch->protocol_id == J2534_PROTOCOL_SW_CAN_PS ||
+                       ch->protocol_id == J2534_PROTOCOL_SW_ISO15765_PS)) {
+                ESP_LOGI(TAG, "IOCTL: SW_CAN_HS - switching to high-speed mode (83.3K)");
+                can_disable();
+                can_set_bitrate(CAN_83K);
+                can_enable();
+            } else {
+                ESP_LOGW(TAG, "SW_CAN_HS not applicable for protocol 0x%lX", 
+                         ch ? ch->protocol_id : 0);
+                return J2534_ERR_NOT_SUPPORTED;
+            }
+            break;
+
+        // SWCAN Normal-Speed Mode (back to 33.3K)
+        case J2534_IOCTL_SW_CAN_NS:
+            if (ch && (ch->protocol_id == J2534_PROTOCOL_SW_CAN_PS ||
+                       ch->protocol_id == J2534_PROTOCOL_SW_ISO15765_PS)) {
+                ESP_LOGI(TAG, "IOCTL: SW_CAN_NS - switching to normal-speed mode (33.3K)");
+                can_disable();
+                can_set_bitrate(CAN_33K);
+                can_enable();
+            } else {
+                ESP_LOGW(TAG, "SW_CAN_NS not applicable for protocol 0x%lX",
+                         ch ? ch->protocol_id : 0);
+                return J2534_ERR_NOT_SUPPORTED;
+            }
+            break;
+
         default:
             ESP_LOGW(TAG, "Unsupported IOCTL ID: 0x%04lX", ioctl_id);
             j2534_set_error(J2534_ERR_INVALID_IOCTL_ID, "Unsupported IOCTL");

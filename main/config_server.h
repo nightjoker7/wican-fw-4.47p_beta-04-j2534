@@ -30,17 +30,23 @@
 #define BLESTA_MODE         3
 #define STA_MODE            4
 
+// CAN baud rate constants - use definitions from can.h
+// These are kept for web config UI compatibility but should use can.h
+#ifndef CAN_5K
 #define CAN_5K				0
 #define CAN_10K				1
 #define CAN_20K				2
 #define CAN_25K				3
-#define CAN_50K				4
-#define CAN_100K			5
-#define CAN_125K			6
-#define CAN_250K			7
-#define CAN_500K			8
-#define CAN_800K			9
-#define CAN_1000K			10
+#define CAN_33K				4   // SWCAN / GMLAN normal-speed (33.3 kbps)
+#define CAN_50K				5
+#define CAN_83K				6   // SWCAN / GMLAN high-speed (83.3 kbps)
+#define CAN_100K			7
+#define CAN_125K			8
+#define CAN_250K			9
+#define CAN_500K			10
+#define CAN_800K			11
+#define CAN_1000K			12
+#endif
 
 #define CAN_NORMAL			0
 #define CAN_SILENT			1
