@@ -398,14 +398,47 @@ bool wican_connect_usb(wican_context_t *ctx, const char *com_port, uint32_t baud
         OutputDebugStringA(dbg);
     }
     
-    /* CH342 driver has a quirk where SetCommState always fails.
-     * The WiCAN firmware configures the CH342 to 2Mbaud at startup.
-     * Just verify the baud rate is acceptable and skip SetCommState. */
-    if (dcb.BaudRate != use_baudrate && dcb.BaudRate != 2000000) {
+    /* Try to set the baud rate if it's not already at 2Mbaud */
+    if (dcb.BaudRate != use_baudrate) {
         char dbg[128];
-        sprintf(dbg, "[WICAN] wican_connect_usb: unexpected baud rate %lu\n", dcb.BaudRate);
+        sprintf(dbg, "[WICAN] wican_connect_usb: baud rate is %lu, trying to set %lu\n", dcb.BaudRate, use_baudrate);
         OutputDebugStringA(dbg);
-        /* Continue anyway - the firmware may have set a compatible rate */
+        
+        dcb.BaudRate = use_baudrate;
+        dcb.ByteSize = 8;
+        dcb.Parity = NOPARITY;
+        dcb.StopBits = ONESTOPBIT;
+        dcb.fBinary = TRUE;
+        dcb.fParity = FALSE;
+        dcb.fOutxCtsFlow = FALSE;
+        dcb.fOutxDsrFlow = FALSE;
+        dcb.fDtrControl = DTR_CONTROL_ENABLE;
+        dcb.fRtsControl = RTS_CONTROL_ENABLE;
+        dcb.fOutX = FALSE;
+        dcb.fInX = FALSE;
+        
+        if (!SetCommState(ctx->hSerial, &dcb)) {
+            DWORD err = GetLastError();
+            sprintf(dbg, "[WICAN] wican_connect_usb: SetCommState failed (error %lu) - CH342 quirk, continuing\n", err);
+            OutputDebugStringA(dbg);
+            /* CH342 driver returns error but may still work - continue anyway */
+        } else {
+            OutputDebugStringA("[WICAN] wican_connect_usb: SetCommState succeeded\n");
+        }
+        
+        /* Verify the baud rate was actually set */
+        DCB dcb_verify;
+        dcb_verify.DCBlength = sizeof(dcb_verify);
+        if (GetCommState(ctx->hSerial, &dcb_verify)) {
+            sprintf(dbg, "[WICAN] wican_connect_usb: baud rate is now %lu\n", dcb_verify.BaudRate);
+            OutputDebugStringA(dbg);
+            
+            if (dcb_verify.BaudRate != use_baudrate && dcb_verify.BaudRate != 2000000) {
+                sprintf(dbg, "[WICAN] WARNING: Baud rate mismatch! Port=%lu, Expected=%lu\n", dcb_verify.BaudRate, use_baudrate);
+                OutputDebugStringA(dbg);
+                /* Connection may fail - but try anyway */
+            }
+        }
     }
     
     /* Skip SetCommState - CH342 driver doesn't support it properly */
