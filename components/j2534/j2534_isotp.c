@@ -124,14 +124,95 @@ void isotp_buffer_complete_message(j2534_channel_t *ch, uint32_t can_id,
  * CAN Frame to J2534 Message Conversion
  * =========================================================================== */
 
+/**
+ * @brief Find the best matching channel for an incoming CAN frame
+ * 
+ * This function searches ALL active channels to find which one has a filter
+ * that matches the incoming frame's CAN ID. This is critical to avoid race
+ * conditions where j2534_active_channel might change between frame reception
+ * and processing.
+ * 
+ * Priority order:
+ * 1. ISO15765 channel with FLOW_CONTROL filter matching the CAN ID (highest priority)
+ * 2. ISO15765 channel with PASS filter matching the CAN ID
+ * 3. Raw CAN channel with PASS filter matching the CAN ID
+ * 4. Fall back to j2534_active_channel if no filter match found
+ * 
+ * @param frame The received CAN frame
+ * @return Pointer to the matching channel, or NULL if no match
+ */
+static j2534_channel_t* j2534_find_channel_for_frame(twai_message_t *frame)
+{
+    j2534_channel_t *iso15765_fc_match = NULL;    // ISO15765 with FLOW_CONTROL match
+    j2534_channel_t *iso15765_pass_match = NULL;  // ISO15765 with PASS filter match
+    j2534_channel_t *can_pass_match = NULL;       // Raw CAN with PASS filter match
+    
+    // Search all channels
+    for (int ch_idx = 0; ch_idx < J2534_MAX_CHANNELS; ch_idx++) {
+        j2534_channel_t *ch = &j2534_channels[ch_idx];
+        if (!ch->active) continue;
+        
+        bool is_iso15765 = (ch->protocol_id == J2534_PROTOCOL_ISO15765 ||
+                           ch->protocol_id == J2534_PROTOCOL_ISO15765_PS ||
+                           ch->protocol_id == J2534_PROTOCOL_SW_ISO15765_PS);
+        
+        // Check all filters on this channel
+        for (uint32_t i = 0; i < J2534_MAX_FILTERS; i++) {
+            if (!ch->filters[i].active) continue;
+            
+            uint32_t mask = (ch->filters[i].mask[0] << 24) |
+                           (ch->filters[i].mask[1] << 16) |
+                           (ch->filters[i].mask[2] << 8) |
+                           ch->filters[i].mask[3];
+            uint32_t pattern = (ch->filters[i].pattern[0] << 24) |
+                              (ch->filters[i].pattern[1] << 16) |
+                              (ch->filters[i].pattern[2] << 8) |
+                              ch->filters[i].pattern[3];
+            
+            bool filter_match = ((frame->identifier & mask) == (pattern & mask));
+            
+            if (filter_match) {
+                if (ch->filters[i].filter_type == J2534_FILTER_FLOW_CONTROL && is_iso15765) {
+                    // Highest priority: ISO15765 FLOW_CONTROL filter match
+                    iso15765_fc_match = ch;
+                    ESP_LOGI(TAG, "j2534_find_channel: Frame 0x%lX matches FLOW_CONTROL on ch %lu (proto=0x%lX)",
+                             frame->identifier, ch->channel_id, ch->protocol_id);
+                } else if (ch->filters[i].filter_type == J2534_FILTER_PASS) {
+                    if (is_iso15765 && !iso15765_pass_match) {
+                        iso15765_pass_match = ch;
+                        ESP_LOGI(TAG, "j2534_find_channel: Frame 0x%lX matches PASS on ISO15765 ch %lu",
+                                 frame->identifier, ch->channel_id);
+                    } else if (!is_iso15765 && !can_pass_match) {
+                        can_pass_match = ch;
+                        ESP_LOGI(TAG, "j2534_find_channel: Frame 0x%lX matches PASS on CAN ch %lu",
+                                 frame->identifier, ch->channel_id);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Return in priority order
+    if (iso15765_fc_match) return iso15765_fc_match;
+    if (iso15765_pass_match) return iso15765_pass_match;
+    if (can_pass_match) return can_pass_match;
+    
+    // No filter match - fall back to active channel
+    return j2534_get_channel(j2534_active_channel);
+}
+
 int32_t j2534_can_to_msg(twai_message_t *frame, uint8_t *output_buf)
 {
     if (!frame || !output_buf || !j2534_is_active()) {
         return 0;
     }
 
-    j2534_channel_t *ch = j2534_get_channel(j2534_active_channel);
+    // CRITICAL FIX: Find the correct channel based on filter match, not j2534_active_channel
+    // This prevents race conditions where the active channel changes between frame reception
+    // and processing, which would cause ISO15765 frames to be processed as raw CAN.
+    j2534_channel_t *ch = j2534_find_channel_for_frame(frame);
     if (!ch) {
+        ESP_LOGW(TAG, "j2534_can_to_msg: No channel found for frame ID=0x%lX", frame->identifier);
         return 0;
     }
 
@@ -164,8 +245,8 @@ int32_t j2534_can_to_msg(twai_message_t *frame, uint8_t *output_buf)
 
     bool permissive_mode = false;
 
-    ESP_LOGI(TAG, "j2534_can_to_msg: RX frame ID=0x%lX, DLC=%d, filter_count=%lu, funct_count=%lu, iso15765=%d, raw_can=%d, has_pass=%d, last_tx=0x%lX, func_mode=%d",
-             frame->identifier, frame->data_length_code, ch->filter_count, ch->funct_msg_count, is_iso15765, is_raw_can, has_pass_filter, j2534_last_tx_id, functional_mode);
+    ESP_LOGI(TAG, "j2534_can_to_msg: RX frame ID=0x%lX, DLC=%d, ch=%lu, proto=0x%lX, filter_count=%lu, iso15765=%d, raw_can=%d, has_pass=%d, last_tx=0x%lX",
+             frame->identifier, frame->data_length_code, ch->channel_id, ch->protocol_id, ch->filter_count, is_iso15765, is_raw_can, has_pass_filter, j2534_last_tx_id);
 
     // Check PASS/FLOW_CONTROL filters
     for (uint32_t i = 0; i < J2534_MAX_FILTERS && !pass; i++) {
