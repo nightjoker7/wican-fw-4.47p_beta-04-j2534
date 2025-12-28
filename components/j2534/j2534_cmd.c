@@ -444,7 +444,7 @@ void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_
                 uint16_t msg_len = (data[offset] << 8) | data[offset + 1];
                 offset += 2;
                 
-                if (msg_len < 4 || offset + msg_len > len) {
+                if (msg_len < 5 || offset + msg_len > len) {  // min: CAN_ID(4) + flags(1)
                     ESP_LOGW(TAG, "BATCH: Invalid msg len %u at offset %lu", msg_len, offset);
                     break;
                 }
@@ -457,14 +457,24 @@ void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_
                                        (data[offset + 1] << 16) |
                                        (data[offset + 2] << 8) |
                                        data[offset + 3];
-                can_frame.identifier &= 0x7FF;  // 11-bit ID
-                can_frame.extd = 0;
+                
+                // Parse flags byte (bit 0 = extended ID)
+                uint8_t flags = data[offset + 4];
+                if (flags & 0x01) {
+                    // 29-bit extended ID
+                    can_frame.identifier &= 0x1FFFFFFF;
+                    can_frame.extd = 1;
+                } else {
+                    // 11-bit standard ID
+                    can_frame.identifier &= 0x7FF;
+                    can_frame.extd = 0;
+                }
                 can_frame.self = 0;
                 
-                uint8_t payload_len = msg_len - 4;
+                uint8_t payload_len = msg_len - 5;  // subtract CAN_ID(4) + flags(1)
                 if (payload_len > 8) payload_len = 8;
                 can_frame.data_length_code = payload_len;
-                memcpy(can_frame.data, &data[offset + 4], payload_len);
+                memcpy(can_frame.data, &data[offset + 5], payload_len);
                 
                 offset += msg_len;
                 

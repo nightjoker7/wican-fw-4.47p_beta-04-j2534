@@ -1205,10 +1205,10 @@ bool wican_write_messages_batch(wican_context_t *ctx, uint32_t channel_id,
     data[offset++] = (num_msgs >> 8) & 0xFF;
     data[offset++] = num_msgs & 0xFF;
     
-    /* Pack each message: msg_len(2) + CAN_ID(4) + data(up to 8) */
+    /* Pack each message: msg_len(2) + CAN_ID(4) + flags(1) + data(up to 8) */
     for (uint32_t i = 0; i < num_msgs; i++) {
-        uint16_t msg_len = 4 + msgs[i].data_len;  /* CAN ID + data */
-        if (msg_len > 12) msg_len = 12;  /* Max 4 + 8 for raw CAN */
+        uint16_t msg_len = 4 + 1 + msgs[i].data_len;  /* CAN ID + flags + data */
+        if (msg_len > 13) msg_len = 13;  /* Max 4 + 1 + 8 for raw CAN */
         
         /* Check if we have room for this message */
         if (offset + 2 + msg_len > WICAN_MAX_PACKET_SIZE - 10) {
@@ -1231,6 +1231,9 @@ bool wican_write_messages_batch(wican_context_t *ctx, uint32_t channel_id,
         data[offset++] = (msgs[i].can_id >> 16) & 0xFF;
         data[offset++] = (msgs[i].can_id >> 8) & 0xFF;
         data[offset++] = msgs[i].can_id & 0xFF;
+        
+        /* Flags (bit 0 = extended ID) */
+        data[offset++] = msgs[i].flags;
         
         /* Data */
         uint8_t copy_len = msgs[i].data_len;
