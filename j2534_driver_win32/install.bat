@@ -26,6 +26,25 @@ echo Copying DLL files...
 REM Look for built DLLs in various locations
 set FOUND_32=0
 set FOUND_64=0
+set FOUND_CFG=0
+
+if exist "bin\wican_j2534_32.dll" (
+    copy /Y "bin\wican_j2534_32.dll" "%INSTALL_DIR%\"
+    set FOUND_32=1
+    echo   Installed: wican_j2534_32.dll from bin
+)
+
+if exist "bin\wican_j2534_64.dll" (
+    copy /Y "bin\wican_j2534_64.dll" "%INSTALL_DIR%\"
+    set FOUND_64=1
+    echo   Installed: wican_j2534_64.dll from bin
+)
+
+if exist "bin\wican_config.exe" (
+    copy /Y "bin\wican_config.exe" "%INSTALL_DIR%\"
+    set FOUND_CFG=1
+    echo   Installed: wican_config.exe from bin
+)
 
 if exist "build\Release\wican_j2534_32.dll" (
     copy /Y "build\Release\wican_j2534_32.dll" "%INSTALL_DIR%\"

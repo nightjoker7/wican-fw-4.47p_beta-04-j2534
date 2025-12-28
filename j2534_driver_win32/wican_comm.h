@@ -1,8 +1,8 @@
 /**
  * @file wican_comm.h
- * @brief WiCAN TCP Communication Module
+ * @brief WiCAN Communication Module
  * 
- * Handles TCP/IP communication with WiCAN Pro device
+ * Handles TCP/IP and USB Serial communication with WiCAN Pro device
  */
 
 #ifndef WICAN_COMM_H
@@ -28,9 +28,14 @@ extern "C" {
  * ============================================================================ */
 #define WICAN_DEFAULT_PORT          3333
 #define WICAN_DEFAULT_IP            "192.168.80.1"
+#define WICAN_DEFAULT_BAUDRATE      2000000  /* USB serial baud rate */
 #define WICAN_MAX_PACKET_SIZE       4200   /* ISO-TP max: 4128 + headers */
 #define WICAN_CONNECT_TIMEOUT_MS    5000
 #define WICAN_READ_TIMEOUT_MS       1000
+
+/* Transport types */
+#define WICAN_TRANSPORT_TCP         0
+#define WICAN_TRANSPORT_USB         1
 
 /* Protocol sync bytes */
 #define WICAN_SYNC_BYTE1            0x55
@@ -76,10 +81,21 @@ extern "C" {
 
 /* WiCAN connection context */
 typedef struct {
+    /* Transport type */
+    uint8_t transport_type;       /* WICAN_TRANSPORT_TCP or WICAN_TRANSPORT_USB */
+    
+    /* TCP connection */
     SOCKET socket;
-    bool connected;
     char ip_address[64];
     uint16_t port;
+    
+    /* USB Serial connection */
+    HANDLE hSerial;
+    char com_port[16];            /* e.g., "COM12" */
+    uint32_t serial_baudrate;
+    
+    /* Common */
+    bool connected;
     CRITICAL_SECTION cs_socket;
     uint32_t device_id;
 } wican_context_t;
@@ -121,13 +137,37 @@ bool wican_init(void);
 void wican_cleanup(void);
 
 /**
- * @brief Connect to WiCAN device
+ * @brief Connect to WiCAN device via TCP
  * @param ctx Pointer to context structure
  * @param ip_address IP address of device (NULL for default)
  * @param port Port number (0 for default)
  * @return true on success
  */
 bool wican_connect(wican_context_t *ctx, const char *ip_address, uint16_t port);
+
+/**
+ * @brief Connect to WiCAN device via USB Serial
+ * @param ctx Pointer to context structure
+ * @param com_port COM port name (e.g., "COM12") or NULL for auto-detect
+ * @param baudrate Baud rate (0 for default 2000000)
+ * @return true on success
+ */
+bool wican_connect_usb(wican_context_t *ctx, const char *com_port, uint32_t baudrate);
+
+/**
+ * @brief Auto-detect and connect to WiCAN device (tries USB first, then TCP)
+ * @param ctx Pointer to context structure
+ * @return true on success
+ */
+bool wican_connect_auto(wican_context_t *ctx);
+
+/**
+ * @brief Find WiCAN USB devices
+ * @param ports Array to store COM port names (each 16 chars)
+ * @param max_ports Maximum number of ports to find
+ * @return Number of WiCAN devices found
+ */
+int wican_find_usb_devices(char ports[][16], int max_ports);
 
 /**
  * @brief Disconnect from WiCAN device

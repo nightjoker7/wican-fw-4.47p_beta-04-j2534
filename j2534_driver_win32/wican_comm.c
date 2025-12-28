@@ -1,11 +1,18 @@
 /**
  * @file wican_comm.c
- * @brief WiCAN TCP Communication Implementation
+ * @brief WiCAN TCP and USB Serial Communication Implementation
  */
 
 #include "wican_comm.h"
 #include <stdio.h>
 #include <string.h>
+#include <setupapi.h>
+
+#pragma comment(lib, "setupapi.lib")
+
+/* GUID for USB Serial devices (COM ports) */
+static const GUID GUID_DEVINTERFACE_COMPORT = 
+    {0x86E0D1E0L, 0x8089, 0x11D0, {0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73}};
 
 /* ============================================================================
  * Private Variables
@@ -14,6 +21,8 @@ static bool g_winsock_initialized = false;
 static WSADATA g_wsa_data;
 static char g_config_ip[64] = "";
 static uint16_t g_config_port = 0;
+static char g_config_com_port[16] = "";
+static uint8_t g_config_transport = WICAN_TRANSPORT_TCP;
 
 /* ============================================================================
  * Registry Functions
@@ -42,8 +51,20 @@ static void load_config_from_registry(void)
                 g_config_port = (uint16_t)port;
             }
             
+            /* Read USB Serial settings */
+            size = sizeof(g_config_com_port);
+            type = REG_SZ;
+            RegQueryValueExA(hKey, "COMPort", NULL, &type, (LPBYTE)g_config_com_port, &size);
+            
+            DWORD transport = WICAN_TRANSPORT_TCP;
+            size = sizeof(transport);
+            type = REG_DWORD;
+            if (RegQueryValueExA(hKey, "Transport", NULL, &type, (LPBYTE)&transport, &size) == ERROR_SUCCESS) {
+                g_config_transport = (uint8_t)transport;
+            }
+            
             RegCloseKey(hKey);
-            if (g_config_ip[0] != '\0') break;
+            if (g_config_ip[0] != '\0' || g_config_com_port[0] != '\0') break;
         }
     }
 }
@@ -222,8 +243,224 @@ bool wican_connect(wican_context_t *ctx, const char *ip_address, uint16_t port)
     int flag = 1;
     setsockopt(ctx->socket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
     
+    ctx->transport_type = WICAN_TRANSPORT_TCP;
     ctx->connected = true;
     return true;
+}
+
+/* ============================================================================
+ * USB Serial Functions
+ * ============================================================================ */
+
+int wican_find_usb_devices(char ports[][16], int max_ports)
+{
+    HDEVINFO hDevInfo;
+    SP_DEVINFO_DATA devInfoData;
+    int count = 0;
+    char friendlyName[256];
+    char portName[16];
+    DWORD size;
+    HKEY hDevKey;
+    
+    OutputDebugStringA("[WICAN] wican_find_usb_devices: scanning for WiCAN devices...\n");
+    
+    hDevInfo = SetupDiGetClassDevsA(&GUID_DEVINTERFACE_COMPORT, NULL, NULL, 
+                                     DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        OutputDebugStringA("[WICAN] wican_find_usb_devices: SetupDiGetClassDevs failed\n");
+        return 0;
+    }
+    
+    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+    
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
+        /* Get friendly name */
+        if (SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData, SPDRP_FRIENDLYNAME,
+                                               NULL, (PBYTE)friendlyName, sizeof(friendlyName), &size)) {
+            
+            /* Look for CH342 (WiCAN Pro USB chip) */
+            if (strstr(friendlyName, "CH342") != NULL || 
+                strstr(friendlyName, "CH34") != NULL ||
+                strstr(friendlyName, "WiCAN") != NULL) {
+                
+                /* Get the COM port name from device registry */
+                hDevKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData, DICS_FLAG_GLOBAL, 
+                                                0, DIREG_DEV, KEY_READ);
+                if (hDevKey != INVALID_HANDLE_VALUE) {
+                    size = sizeof(portName);
+                    if (RegQueryValueExA(hDevKey, "PortName", NULL, NULL, 
+                                         (LPBYTE)portName, &size) == ERROR_SUCCESS) {
+                        if (count < max_ports) {
+                            strncpy(ports[count], portName, 15);
+                            ports[count][15] = '\0';
+                            
+                            char dbg[256];
+                            sprintf(dbg, "[WICAN] Found WiCAN device: %s (%s)\n", portName, friendlyName);
+                            OutputDebugStringA(dbg);
+                            
+                            count++;
+                        }
+                    }
+                    RegCloseKey(hDevKey);
+                }
+            }
+        }
+    }
+    
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    
+    char dbg[64];
+    sprintf(dbg, "[WICAN] wican_find_usb_devices: found %d devices\n", count);
+    OutputDebugStringA(dbg);
+    
+    return count;
+}
+
+bool wican_connect_usb(wican_context_t *ctx, const char *com_port, uint32_t baudrate)
+{
+    char portPath[32];
+    DCB dcb;
+    COMMTIMEOUTS timeouts;
+    const char *use_port;
+    uint32_t use_baudrate;
+    char found_ports[8][16];
+    
+    OutputDebugStringA("[WICAN] wican_connect_usb: START\n");
+    
+    if (!ctx) {
+        OutputDebugStringA("[WICAN] wican_connect_usb: ctx is NULL\n");
+        return false;
+    }
+    
+    memset(ctx, 0, sizeof(wican_context_t));
+    InitializeCriticalSection(&ctx->cs_socket);
+    ctx->socket = INVALID_SOCKET;
+    ctx->hSerial = INVALID_HANDLE_VALUE;
+    
+    /* Determine which COM port to use */
+    if (com_port && com_port[0]) {
+        use_port = com_port;
+    } else if (g_config_com_port[0]) {
+        use_port = g_config_com_port;
+    } else {
+        /* Auto-detect */
+        int num_found = wican_find_usb_devices(found_ports, 8);
+        if (num_found > 0) {
+            use_port = found_ports[0];
+            OutputDebugStringA("[WICAN] wican_connect_usb: auto-detected port\n");
+        } else {
+            OutputDebugStringA("[WICAN] wican_connect_usb: no WiCAN USB devices found\n");
+            DeleteCriticalSection(&ctx->cs_socket);
+            return false;
+        }
+    }
+    
+    use_baudrate = baudrate ? baudrate : WICAN_DEFAULT_BAUDRATE;
+    
+    strncpy(ctx->com_port, use_port, sizeof(ctx->com_port) - 1);
+    ctx->serial_baudrate = use_baudrate;
+    
+    /* Build the port path */
+    sprintf(portPath, "\\\\.\\%s", use_port);
+    
+    {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_connect_usb: opening %s at %lu baud\n", portPath, use_baudrate);
+        OutputDebugStringA(dbg);
+    }
+    
+    /* Open the serial port */
+    ctx->hSerial = CreateFileA(portPath, GENERIC_READ | GENERIC_WRITE, 
+                                0, NULL, OPEN_EXISTING, 0, NULL);
+    
+    if (ctx->hSerial == INVALID_HANDLE_VALUE) {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_connect_usb: CreateFile failed, error=%lu\n", GetLastError());
+        OutputDebugStringA(dbg);
+        DeleteCriticalSection(&ctx->cs_socket);
+        return false;
+    }
+    
+    /* Configure the serial port - get current state first to preserve driver-specific flags */
+    dcb.DCBlength = sizeof(dcb);
+    
+    if (!GetCommState(ctx->hSerial, &dcb)) {
+        OutputDebugStringA("[WICAN] wican_connect_usb: GetCommState failed\n");
+        CloseHandle(ctx->hSerial);
+        ctx->hSerial = INVALID_HANDLE_VALUE;
+        DeleteCriticalSection(&ctx->cs_socket);
+        return false;
+    }
+    
+    {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] USB port current settings: Baud=%lu, ByteSize=%d\n", dcb.BaudRate, dcb.ByteSize);
+        OutputDebugStringA(dbg);
+    }
+    
+    /* CH342 driver has a quirk where SetCommState always fails.
+     * The WiCAN firmware configures the CH342 to 2Mbaud at startup.
+     * Just verify the baud rate is acceptable and skip SetCommState. */
+    if (dcb.BaudRate != use_baudrate && dcb.BaudRate != 2000000) {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_connect_usb: unexpected baud rate %lu\n", dcb.BaudRate);
+        OutputDebugStringA(dbg);
+        /* Continue anyway - the firmware may have set a compatible rate */
+    }
+    
+    /* Skip SetCommState - CH342 driver doesn't support it properly */
+    
+    /* Set timeouts */
+    timeouts.ReadIntervalTimeout = 50;
+    timeouts.ReadTotalTimeoutConstant = WICAN_READ_TIMEOUT_MS;
+    timeouts.ReadTotalTimeoutMultiplier = 10;
+    timeouts.WriteTotalTimeoutConstant = 1000;
+    timeouts.WriteTotalTimeoutMultiplier = 10;
+    
+    if (!SetCommTimeouts(ctx->hSerial, &timeouts)) {
+        OutputDebugStringA("[WICAN] wican_connect_usb: SetCommTimeouts failed\n");
+        CloseHandle(ctx->hSerial);
+        ctx->hSerial = INVALID_HANDLE_VALUE;
+        DeleteCriticalSection(&ctx->cs_socket);
+        return false;
+    }
+    
+    /* Clear any pending data */
+    PurgeComm(ctx->hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    
+    ctx->transport_type = WICAN_TRANSPORT_USB;
+    ctx->connected = true;
+    
+    OutputDebugStringA("[WICAN] wican_connect_usb: SUCCESS\n");
+    return true;
+}
+
+bool wican_connect_auto(wican_context_t *ctx)
+{
+    char found_ports[8][16];
+    int num_found;
+    
+    OutputDebugStringA("[WICAN] wican_connect_auto: trying USB first...\n");
+    
+    /* First, check registry for preferred transport */
+    if (g_config_transport == WICAN_TRANSPORT_USB || g_config_com_port[0]) {
+        if (wican_connect_usb(ctx, g_config_com_port, 0)) {
+            return true;
+        }
+    }
+    
+    /* Try to find USB devices */
+    num_found = wican_find_usb_devices(found_ports, 8);
+    if (num_found > 0) {
+        if (wican_connect_usb(ctx, found_ports[0], 0)) {
+            return true;
+        }
+    }
+    
+    OutputDebugStringA("[WICAN] wican_connect_auto: USB failed, trying TCP...\n");
+    
+    /* Fall back to TCP */
+    return wican_connect(ctx, NULL, 0);
 }
 
 void wican_disconnect(wican_context_t *ctx)
@@ -234,10 +471,21 @@ void wican_disconnect(wican_context_t *ctx)
     
     EnterCriticalSection(&ctx->cs_socket);
     
-    if (ctx->connected && ctx->socket != INVALID_SOCKET) {
-        shutdown(ctx->socket, SD_BOTH);
-        closesocket(ctx->socket);
-        ctx->socket = INVALID_SOCKET;
+    if (ctx->connected) {
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+            /* Close USB serial */
+            if (ctx->hSerial != INVALID_HANDLE_VALUE) {
+                CloseHandle(ctx->hSerial);
+                ctx->hSerial = INVALID_HANDLE_VALUE;
+            }
+        } else {
+            /* Close TCP socket */
+            if (ctx->socket != INVALID_SOCKET) {
+                shutdown(ctx->socket, SD_BOTH);
+                closesocket(ctx->socket);
+                ctx->socket = INVALID_SOCKET;
+            }
+        }
     }
     ctx->connected = false;
     
@@ -295,7 +543,7 @@ bool wican_send_command(wican_context_t *ctx, uint8_t cmd, const uint8_t *data, 
     
     {
         char dbg[256];
-        sprintf(dbg, "wican_send_command: cmd=0x%02X len=%d packet=", cmd, packet_len);
+        sprintf(dbg, "wican_send_command: cmd=0x%02X len=%d transport=%d packet=", cmd, packet_len, ctx->transport_type);
         OutputDebugStringA(dbg);
         for (int i = 0; i < packet_len && i < 20; i++) {
             sprintf(dbg, "%02X ", packet[i]);
@@ -304,17 +552,32 @@ bool wican_send_command(wican_context_t *ctx, uint8_t cmd, const uint8_t *data, 
         OutputDebugStringA("\n");
     }
     
-    sent = send(ctx->socket, (const char*)packet, packet_len, 0);
-    
-    LeaveCriticalSection(&ctx->cs_socket);
-    
-    if (sent != packet_len) {
-        char dbg[128];
-        sprintf(dbg, "wican_send_command: send failed, sent=%d, error=%d\n", sent, WSAGetLastError());
-        OutputDebugStringA(dbg);
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        /* USB Serial transport */
+        DWORD bytes_written = 0;
+        BOOL result = WriteFile(ctx->hSerial, packet, packet_len, &bytes_written, NULL);
+        LeaveCriticalSection(&ctx->cs_socket);
+        
+        if (!result || bytes_written != packet_len) {
+            char dbg[128];
+            sprintf(dbg, "wican_send_command: WriteFile failed, written=%lu, error=%lu\n", bytes_written, GetLastError());
+            OutputDebugStringA(dbg);
+            return false;
+        }
+        return true;
+    } else {
+        /* TCP transport */
+        sent = send(ctx->socket, (const char*)packet, packet_len, 0);
+        LeaveCriticalSection(&ctx->cs_socket);
+        
+        if (sent != packet_len) {
+            char dbg[128];
+            sprintf(dbg, "wican_send_command: send failed, sent=%d, error=%d\n", sent, WSAGetLastError());
+            OutputDebugStringA(dbg);
+            return false;
+        }
+        return true;
     }
-    
-    return (sent == packet_len);
 }
 
 bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
@@ -326,6 +589,7 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
     int received;
     DWORD old_timeout;
     int opt_len = sizeof(old_timeout);
+    COMMTIMEOUTS old_timeouts, new_timeouts;
     
     if (!ctx || !ctx->connected) {
         OutputDebugStringA("wican_receive_response: not connected\n");
@@ -334,17 +598,37 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
     
     EnterCriticalSection(&ctx->cs_socket);
     
-    getsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&old_timeout, &opt_len);
-    DWORD new_timeout = timeout_ms;
-    setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&new_timeout, sizeof(new_timeout));
-    
-    /* Read header: SYNC1, SYNC2, CMD|0x80, STATUS, LEN_H, LEN_L */
-    received = recv(ctx->socket, (char*)header, 6, MSG_WAITALL);
-    if (received != 6) {
-        char dbg[128];
-        sprintf(dbg, "wican_receive_response: recv header failed, got %d bytes, error %d\n", received, WSAGetLastError());
-        OutputDebugStringA(dbg);
-        goto error;
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        /* USB Serial transport - set read timeout */
+        GetCommTimeouts(ctx->hSerial, &old_timeouts);
+        new_timeouts = old_timeouts;
+        new_timeouts.ReadIntervalTimeout = 50;
+        new_timeouts.ReadTotalTimeoutConstant = timeout_ms;
+        new_timeouts.ReadTotalTimeoutMultiplier = 10;
+        SetCommTimeouts(ctx->hSerial, &new_timeouts);
+        
+        /* Read header */
+        DWORD bytes_read = 0;
+        if (!ReadFile(ctx->hSerial, header, 6, &bytes_read, NULL) || bytes_read != 6) {
+            char dbg[128];
+            sprintf(dbg, "wican_receive_response: ReadFile header failed, got %lu bytes, error %lu\n", bytes_read, GetLastError());
+            OutputDebugStringA(dbg);
+            goto error_usb;
+        }
+    } else {
+        /* TCP transport */
+        getsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&old_timeout, &opt_len);
+        DWORD new_timeout = timeout_ms;
+        setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&new_timeout, sizeof(new_timeout));
+        
+        /* Read header: SYNC1, SYNC2, CMD|0x80, STATUS, LEN_H, LEN_L */
+        received = recv(ctx->socket, (char*)header, 6, MSG_WAITALL);
+        if (received != 6) {
+            char dbg[128];
+            sprintf(dbg, "wican_receive_response: recv header failed, got %d bytes, error %d\n", received, WSAGetLastError());
+            OutputDebugStringA(dbg);
+            goto error_tcp;
+        }
     }
     
     {
@@ -356,7 +640,8 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
     
     if (header[0] != WICAN_SYNC_BYTE1 || header[1] != WICAN_SYNC_BYTE2) {
         OutputDebugStringA("wican_receive_response: sync mismatch\n");
-        goto error;
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) goto error_usb;
+        else goto error_tcp;
     }
     
     if (cmd) *cmd = header[2] & 0x7F;  /* Strip response flag */
@@ -365,25 +650,43 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
     
     if (payload_len > *data_len) {
         OutputDebugStringA("wican_receive_response: payload too large\n");
-        goto error;
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) goto error_usb;
+        else goto error_tcp;
     }
     
     /* Calculate checksum starting from header */
     uint8_t calc_checksum = wican_calc_checksum(header, 6);
     
     if (payload_len > 0) {
-        received = recv(ctx->socket, (char*)data, payload_len, MSG_WAITALL);
-        if (received != payload_len) {
-            OutputDebugStringA("wican_receive_response: recv data failed\n");
-            goto error;
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+            DWORD bytes_read = 0;
+            if (!ReadFile(ctx->hSerial, data, payload_len, &bytes_read, NULL) || bytes_read != payload_len) {
+                OutputDebugStringA("wican_receive_response: ReadFile data failed\n");
+                goto error_usb;
+            }
+        } else {
+            received = recv(ctx->socket, (char*)data, payload_len, MSG_WAITALL);
+            if (received != payload_len) {
+                OutputDebugStringA("wican_receive_response: recv data failed\n");
+                goto error_tcp;
+            }
         }
         calc_checksum ^= wican_calc_checksum(data, payload_len);
     }
     
-    received = recv(ctx->socket, (char*)&checksum, 1, MSG_WAITALL);
-    if (received != 1) {
-        OutputDebugStringA("wican_receive_response: recv checksum failed\n");
-        goto error;
+    /* Read checksum byte */
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        DWORD bytes_read = 0;
+        if (!ReadFile(ctx->hSerial, &checksum, 1, &bytes_read, NULL) || bytes_read != 1) {
+            OutputDebugStringA("wican_receive_response: ReadFile checksum failed\n");
+            goto error_usb;
+        }
+    } else {
+        received = recv(ctx->socket, (char*)&checksum, 1, MSG_WAITALL);
+        if (received != 1) {
+            OutputDebugStringA("wican_receive_response: recv checksum failed\n");
+            goto error_tcp;
+        }
     }
     
     {
@@ -394,17 +697,28 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
     
     if (calc_checksum != checksum) {
         OutputDebugStringA("wican_receive_response: checksum mismatch\n");
-        goto error;
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) goto error_usb;
+        else goto error_tcp;
     }
     
     *data_len = payload_len;
     
-    setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
+    /* Restore timeouts and return success */
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        SetCommTimeouts(ctx->hSerial, &old_timeouts);
+    } else {
+        setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
+    }
     LeaveCriticalSection(&ctx->cs_socket);
     OutputDebugStringA("wican_receive_response: success\n");
     return true;
     
-error:
+error_usb:
+    SetCommTimeouts(ctx->hSerial, &old_timeouts);
+    LeaveCriticalSection(&ctx->cs_socket);
+    return false;
+    
+error_tcp:
     setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
     LeaveCriticalSection(&ctx->cs_socket);
     return false;
