@@ -36,6 +36,7 @@
 #include <lwip/netdb.h>
 #include "types.h"
 #include "comm_server.h"
+#include "j2534.h"
 
 #define TAG 		__func__
 
@@ -82,6 +83,11 @@ wait_skt_rx:
 				xEventGroupSetBits( xSocketEventGroup, PORT_CLOSED_BIT );
 				xEventGroupClearBits( xSocketEventGroup, PORT_OPEN_BIT );
 				ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
+				// Reset J2534 state on TCP disconnect
+				if (j2534_is_active()) {
+					ESP_LOGI(TAG, "TCP disconnect - resetting J2534 state");
+					j2534_reset();
+				}
 				xSemaphoreGive( xTCP_Socket_Semaphore );
 				goto wait_skt_rx;
 
@@ -90,6 +96,11 @@ wait_skt_rx:
 				xEventGroupSetBits( xSocketEventGroup, PORT_CLOSED_BIT );
 				xEventGroupClearBits( xSocketEventGroup, PORT_OPEN_BIT );
 				ESP_LOGW(TAG, "Connection closed");
+				// Reset J2534 state on TCP disconnect
+				if (j2534_is_active()) {
+					ESP_LOGI(TAG, "TCP disconnect - resetting J2534 state");
+					j2534_reset();
+				}
 				xSemaphoreGive( xTCP_Socket_Semaphore );
 				goto wait_skt_rx;
 			}
@@ -223,6 +234,11 @@ wait_skt_tx:
 						ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
 						xEventGroupSetBits( xSocketEventGroup, PORT_CLOSED_BIT );
 						xEventGroupClearBits( xSocketEventGroup, PORT_OPEN_BIT );
+						// Reset J2534 state on TCP disconnect
+						if (j2534_is_active()) {
+							ESP_LOGI(TAG, "TCP send error - resetting J2534 state");
+							j2534_reset();
+						}
 						xSemaphoreGive( xTCP_Socket_Semaphore );
 						goto wait_skt_tx;
 					}
