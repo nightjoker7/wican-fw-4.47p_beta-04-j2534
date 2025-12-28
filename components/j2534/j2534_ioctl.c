@@ -380,6 +380,12 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
             break;
 
         default:
+            // Compatibility: Vendor IOCTLs (0x8000+) return success to avoid crashing apps
+            // that probe for device-specific features. Standard IOCTLs still return error.
+            if (ioctl_id >= 0x8000) {
+                ESP_LOGI(TAG, "Unknown vendor IOCTL 0x%04lX - returning success (compatibility)", ioctl_id);
+                return J2534_STATUS_NOERROR;
+            }
             ESP_LOGW(TAG, "Unsupported IOCTL ID: 0x%04lX", ioctl_id);
             j2534_set_error(J2534_ERR_INVALID_IOCTL_ID, "Unsupported IOCTL");
             return J2534_ERR_INVALID_IOCTL_ID;
