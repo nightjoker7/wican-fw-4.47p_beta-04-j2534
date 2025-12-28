@@ -61,6 +61,31 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
                         case J2534_CONFIG_ISO15765_STMIN:
                             list->config_ptr[i].value = ch->iso15765_stmin;
                             break;
+                        // KWP2000/ISO9141 timing parameters
+                        case J2534_CONFIG_P1_MIN:
+                            list->config_ptr[i].value = ch->p1_min;
+                            break;
+                        case J2534_CONFIG_P1_MAX:
+                            list->config_ptr[i].value = ch->p1_max;
+                            break;
+                        case J2534_CONFIG_P2_MIN:
+                            list->config_ptr[i].value = ch->p2_min;
+                            break;
+                        case J2534_CONFIG_P2_MAX:
+                            list->config_ptr[i].value = ch->p2_max;
+                            break;
+                        case J2534_CONFIG_P3_MIN:
+                            list->config_ptr[i].value = ch->p3_min;
+                            break;
+                        case J2534_CONFIG_P3_MAX:
+                            list->config_ptr[i].value = ch->p3_max;
+                            break;
+                        case J2534_CONFIG_P4_MIN:
+                            list->config_ptr[i].value = ch->p4_min;
+                            break;
+                        case J2534_CONFIG_P4_MAX:
+                            list->config_ptr[i].value = ch->p4_max;
+                            break;
                         default:
                             list->config_ptr[i].value = 0;
                             break;
@@ -75,6 +100,8 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
             }
             {
                 j2534_sconfig_list_t *list = (j2534_sconfig_list_t *)input;
+                bool timing_changed = false;
+                
                 for (uint32_t i = 0; i < list->num_of_params; i++) {
                     switch (list->config_ptr[i].parameter) {
                         case J2534_CONFIG_DATA_RATE:
@@ -97,10 +124,50 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
                         case J2534_CONFIG_ISO15765_STMIN:
                             ch->iso15765_stmin = list->config_ptr[i].value;
                             break;
+                        // KWP2000/ISO9141 timing parameters
+                        case J2534_CONFIG_P1_MIN:
+                            ch->p1_min = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P1_MAX:
+                            ch->p1_max = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P2_MIN:
+                            ch->p2_min = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P2_MAX:
+                            ch->p2_max = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P3_MIN:
+                            ch->p3_min = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P3_MAX:
+                            ch->p3_max = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P4_MIN:
+                            ch->p4_min = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
+                        case J2534_CONFIG_P4_MAX:
+                            ch->p4_max = list->config_ptr[i].value;
+                            timing_changed = true;
+                            break;
                         default:
                             break;
                     }
                 }
+                
+#if HARDWARE_VER == WICAN_PRO
+                // Apply timing to STN chip if legacy protocol
+                if (timing_changed && j2534_is_legacy_protocol(ch->protocol_id)) {
+                    stn_j2534_set_timing(ch->p1_max, ch->p2_max, ch->p3_max, ch->p4_min);
+                }
+#endif
             }
             break;
 

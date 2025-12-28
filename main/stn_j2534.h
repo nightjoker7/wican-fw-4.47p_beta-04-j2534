@@ -166,6 +166,35 @@ stn_j2534_status_t stn_j2534_five_baud_init(uint8_t target_address, uint8_t *key
 stn_j2534_status_t stn_j2534_fast_init(void);
 
 /**
+ * @brief Set KWP2000/ISO9141 timing parameters
+ * @param p1_max P1 max time in ms (inter-byte ECU response)
+ * @param p2_max P2 max time in ms (request to response)
+ * @param p3_max P3 max time in ms (response to next request)  
+ * @param p4_min P4 min time in ms (inter-byte tester request)
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_set_timing(uint32_t p1_max, uint32_t p2_max, uint32_t p3_max, uint32_t p4_min);
+
+/**
+ * @brief Send TesterPresent message to keep ECU session alive
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_tester_present(void);
+
+/**
+ * @brief Start periodic TesterPresent (keep-alive)
+ * @param interval_ms Interval between messages (typically 2000ms)
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_start_keep_alive(uint32_t interval_ms);
+
+/**
+ * @brief Stop periodic TesterPresent
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_stop_keep_alive(void);
+
+/**
  * @brief Read battery voltage
  * @param voltage_mv Output voltage in millivolts
  * @return Status code

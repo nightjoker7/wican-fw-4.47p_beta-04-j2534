@@ -440,6 +440,97 @@ stn_j2534_status_t stn_j2534_fast_init(void)
     return stn_j2534_send_cmd("ATFI\r", response, sizeof(response), 5000);
 }
 
+stn_j2534_status_t stn_j2534_set_timing(uint32_t p1_max, uint32_t p2_max, 
+                                         uint32_t p3_max, uint32_t p4_min)
+{
+    char cmd[32];
+    char response[64];
+    stn_j2534_status_t status;
+    
+    // ATTP (Protocol Timing) - sets P2 max timeout
+    // Value in hex, units of 4ms for ELM, or use STPTO for STN (ms precision)
+    if (p2_max > 0) {
+        // Try STN STPTO first (millisecond precision)
+        snprintf(cmd, sizeof(cmd), "STPTO%lu\r", p2_max);
+        status = stn_j2534_send_cmd(cmd, response, sizeof(response), 500);
+        if (status != STN_J2534_STATUS_OK) {
+            // Fall back to ATST (4ms units, max 0xFF = 1020ms)
+            uint32_t st_value = p2_max / 4;
+            if (st_value > 0xFF) st_value = 0xFF;
+            snprintf(cmd, sizeof(cmd), "ATST%02lX\r", st_value);
+            stn_j2534_send_cmd(cmd, response, sizeof(response), 500);
+        }
+    }
+    
+    // P4 min - inter-byte time for tester (ATAT controls adaptive timing)
+    // P4_MIN < 5ms suggests tight timing, disable adaptive
+    if (p4_min > 0 && p4_min < 5) {
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), 500);
+    } else {
+        stn_j2534_send_cmd("ATAT1\r", response, sizeof(response), 500);
+    }
+    
+    // P3 affects inter-message timing - use ATIB for interbyte timing
+    // Note: Most timing is auto-handled by OBD chip, this is best-effort
+    
+    ESP_LOGI(TAG, "Timing set: P1=%lu P2=%lu P3=%lu P4=%lu", 
+             p1_max, p2_max, p3_max, p4_min);
+    
+    return STN_J2534_STATUS_OK;
+}
+
+stn_j2534_status_t stn_j2534_tester_present(void)
+{
+    char response[128];
+    
+    // Send TesterPresent (0x3E) with suppressPositiveResponse subfunction (0x80)
+    // This keeps the ECU diagnostic session alive without cluttering responses
+    return stn_j2534_send_cmd("3E80\r", response, sizeof(response), 500);
+}
+
+// Keep-alive state
+static bool s_keep_alive_active = false;
+static TimerHandle_t s_keep_alive_timer = NULL;
+
+static void keep_alive_timer_callback(TimerHandle_t xTimer)
+{
+    if (s_keep_alive_active && stn_j2534_is_legacy_active()) {
+        stn_j2534_tester_present();
+    }
+}
+
+stn_j2534_status_t stn_j2534_start_keep_alive(uint32_t interval_ms)
+{
+    if (s_keep_alive_timer == NULL) {
+        s_keep_alive_timer = xTimerCreate("kwp_keepalive", 
+                                           pdMS_TO_TICKS(interval_ms),
+                                           pdTRUE,  // Auto-reload
+                                           NULL,
+                                           keep_alive_timer_callback);
+    } else {
+        xTimerChangePeriod(s_keep_alive_timer, pdMS_TO_TICKS(interval_ms), 100);
+    }
+    
+    if (s_keep_alive_timer) {
+        s_keep_alive_active = true;
+        xTimerStart(s_keep_alive_timer, 100);
+        ESP_LOGI(TAG, "Keep-alive started: %lu ms interval", interval_ms);
+        return STN_J2534_STATUS_OK;
+    }
+    
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+stn_j2534_status_t stn_j2534_stop_keep_alive(void)
+{
+    s_keep_alive_active = false;
+    if (s_keep_alive_timer) {
+        xTimerStop(s_keep_alive_timer, 100);
+        ESP_LOGI(TAG, "Keep-alive stopped");
+    }
+    return STN_J2534_STATUS_OK;
+}
+
 stn_j2534_status_t stn_j2534_send_message(
     const uint8_t *data, 
     uint32_t data_len,
@@ -586,6 +677,27 @@ stn_j2534_status_t stn_j2534_five_baud_init(uint8_t target_address, uint8_t *key
 }
 
 stn_j2534_status_t stn_j2534_fast_init(void)
+{
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+stn_j2534_status_t stn_j2534_set_timing(uint32_t p1_max, uint32_t p2_max,
+                                         uint32_t p3_max, uint32_t p4_min)
+{
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+stn_j2534_status_t stn_j2534_tester_present(void)
+{
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+stn_j2534_status_t stn_j2534_start_keep_alive(uint32_t interval_ms)
+{
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+stn_j2534_status_t stn_j2534_stop_keep_alive(void)
 {
     return STN_J2534_STATUS_CHIP_ERROR;
 }

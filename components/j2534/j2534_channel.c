@@ -205,6 +205,17 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
     ch->iso15765_stmin = 0;
     ch->iso15765_ext_addr = false;
     ch->iso15765_ext_addr_byte = 0;
+    
+    // Set default timing parameters for ISO9141/ISO14230 (KWP2000)
+    // These are J2534 standard defaults in milliseconds
+    ch->p1_min = 0;
+    ch->p1_max = 20;      // Inter-byte time ECU response
+    ch->p2_min = 25;
+    ch->p2_max = 50;      // Request to response time (P2 timeout)
+    ch->p3_min = 55;
+    ch->p3_max = 5000;    // Response to next request
+    ch->p4_min = 5;
+    ch->p4_max = 20;      // Inter-byte time tester request
 
     // Clear RX buffer
     j2534_rx_msg_head = 0;
@@ -226,6 +237,13 @@ j2534_error_t j2534_disconnect(uint32_t channel_id)
         j2534_set_error(J2534_ERR_INVALID_CHANNEL_ID, "Invalid channel ID");
         return J2534_ERR_INVALID_CHANNEL_ID;
     }
+
+#if HARDWARE_VER == WICAN_PRO
+    // Stop KWP keep-alive if active
+    if (j2534_is_legacy_protocol(ch->protocol_id)) {
+        stn_j2534_stop_keep_alive();
+    }
+#endif
 
     // Stop all periodic messages for this channel
     for (int i = 0; i < J2534_MAX_PERIODIC_MSGS_ACTIVE; i++) {
