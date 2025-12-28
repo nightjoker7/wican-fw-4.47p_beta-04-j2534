@@ -1063,6 +1063,38 @@ bool wican_get_info(wican_context_t *ctx, char *fw_version, char *hw_version)
     return false;
 }
 
+int wican_drain_rx_buffer(wican_context_t *ctx)
+{
+    int total_drained = 0;
+    char drain_buf[1024];
+    int bytes_read;
+    
+    if (!ctx) return 0;
+    
+    OutputDebugStringA("[WICAN] wican_drain_rx_buffer: Draining receive buffer...\n");
+    
+    /* Set socket to non-blocking mode temporarily */
+    u_long mode = 1;
+    ioctlsocket(ctx->socket, FIONBIO, &mode);
+    
+    /* Read and discard any pending data */
+    while ((bytes_read = recv(ctx->socket, drain_buf, sizeof(drain_buf), 0)) > 0) {
+        total_drained += bytes_read;
+    }
+    
+    /* Restore blocking mode */
+    mode = 0;
+    ioctlsocket(ctx->socket, FIONBIO, &mode);
+    
+    if (total_drained > 0) {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_drain_rx_buffer: Drained %d bytes of stale data\n", total_drained);
+        OutputDebugStringA(dbg);
+    }
+    
+    return total_drained;
+}
+
 bool wican_ioctl(wican_context_t *ctx, uint32_t channel_id, uint32_t ioctl_id,
                  const uint8_t *input_data, uint16_t input_len)
 {

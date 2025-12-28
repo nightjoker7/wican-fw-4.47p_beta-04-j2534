@@ -299,6 +299,17 @@ bool wican_ioctl(wican_context_t *ctx, uint32_t channel_id, uint32_t ioctl_id,
                  const uint8_t *input_data, uint16_t input_len);
 
 /**
+ * @brief Drain any pending data from the receive buffer
+ * 
+ * This is critical for ECU reprogramming to clear stale responses
+ * that may be buffered in the TCP/USB receive queue.
+ * 
+ * @param ctx Pointer to context structure
+ * @return Number of bytes drained
+ */
+int wican_drain_rx_buffer(wican_context_t *ctx);
+
+/**
  * @brief Start a periodic message on the firmware
  * @param ctx Pointer to context structure
  * @param channel_id Channel ID from PassThruConnect

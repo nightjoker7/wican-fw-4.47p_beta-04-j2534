@@ -1052,7 +1052,34 @@ long __stdcall PassThruIoctl(unsigned long HandleID, unsigned long IoctlID,
             break;
             
         case CLEAR_TX_BUFFER:
+            /* TX buffer clearing - send to firmware */
+            OutputDebugStringA("[J2534] IOCTL: CLEAR_TX_BUFFER\n");
+            if (device && channel) {
+                /* Also flush any pending write buffer */
+                if (channel->write_buf.count > 0) {
+                    channel->write_buf.count = 0;
+                    OutputDebugStringA("[J2534] IOCTL: CLEAR_TX_BUFFER - cleared local write buffer\n");
+                }
+                wican_ioctl(&device->wican_ctx, channel->fw_channel_id,
+                            CLEAR_TX_BUFFER, NULL, 0);
+            }
+            break;
+            
         case CLEAR_RX_BUFFER:
+            /* RX buffer clearing - CRITICAL for ECU reprogramming to avoid stale data */
+            OutputDebugStringA("[J2534] IOCTL: CLEAR_RX_BUFFER\n");
+            if (device && channel) {
+                /* First, drain any stale data from the local TCP/USB receive buffer */
+                /* This is critical because data may already be in-flight from firmware */
+                wican_drain_rx_buffer(&device->wican_ctx);
+                
+                /* Then clear the firmware's RX buffer */
+                wican_ioctl(&device->wican_ctx, channel->fw_channel_id,
+                            CLEAR_RX_BUFFER, NULL, 0);
+                
+                /* Drain again to catch any data that arrived during the IOCTL */
+                wican_drain_rx_buffer(&device->wican_ctx);
+            }
             break;
             
         case CLEAR_MSG_FILTERS:
