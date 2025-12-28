@@ -298,14 +298,52 @@ stn_j2534_status_t stn_j2534_reset(void)
 
 stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
 {
-    char cmd[16];
+    char cmd[32];
     char response[128];
     stn_j2534_status_t status;
     
-    // Build ATSP command
+    // Special handling for GM Class 2 UART (8192 baud)
+    if (protocol == STN_PROTO_GM_UART) {
+        ESP_LOGI(TAG, "Initializing GM Class 2 UART protocol");
+        
+        // Reset to defaults first
+        status = stn_j2534_send_cmd("ATD\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK) return status;
+        
+        // Set J1850 VPW as base protocol (closest to Class 2 timing)
+        status = stn_j2534_send_cmd("ATSP2\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK) return status;
+        
+        // Configure for 8192 baud (GM Class 2)
+        // ATIB 96 sets ISO baud rate to 9600 (closest standard rate)
+        // Some STN chips support ATIB 82 for 8192 baud directly
+        status = stn_j2534_send_cmd("ATIB 96\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        // Ignore error - not all chips support this
+        
+        // Set slower timing for Class 2
+        status = stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set longer timeout for Class 2 responses
+        status = stn_j2534_send_cmd("ATST FF\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Enable headers in response
+        status = stn_j2534_send_cmd("ATH1\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "GM Class 2 UART initialized");
+        return STN_J2534_STATUS_OK;
+    }
+    
+    // Build ATSP command for standard protocols
     if (protocol <= 9) {
         snprintf(cmd, sizeof(cmd), "ATSP%d\r", protocol);
-    } else if (protocol <= 0xF) {
+    } else if (protocol <= 0xB) {
         snprintf(cmd, sizeof(cmd), "ATSP%c\r", 'A' + (protocol - 10));
     } else {
         return STN_J2534_STATUS_PROTOCOL_ERROR;

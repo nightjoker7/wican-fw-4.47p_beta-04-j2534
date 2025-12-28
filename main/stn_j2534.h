@@ -55,6 +55,7 @@ typedef enum {
     STN_PROTO_CAN_29B_250K  = 9,    // ISO 15765-4 CAN (29 bit ID, 250 kbaud)
     STN_PROTO_CAN_11B_USER1 = 0xA,  // User CAN (11 bit ID, user baud)
     STN_PROTO_CAN_29B_USER1 = 0xB,  // User CAN (29 bit ID, user baud)
+    STN_PROTO_GM_UART       = 0xC,  // GM Class 2 UART (8192 baud)
 } stn_protocol_t;
 
 /* ============================================================================

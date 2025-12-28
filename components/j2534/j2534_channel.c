@@ -140,6 +140,13 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
             stn_proto = STN_PROTO_ISO14230_FAST;
             base_protocol = J2534_PROTOCOL_ISO14230;
             break;
+
+        // GM Class 2 UART protocol (8192 baud)
+        case J2534_PROTOCOL_GM_UART_PS:
+            is_legacy_protocol = true;
+            stn_proto = STN_PROTO_GM_UART;
+            ESP_LOGI(TAG, "Using OBD chip for GM Class 2 UART");
+            break;
 #endif
 
         default:
