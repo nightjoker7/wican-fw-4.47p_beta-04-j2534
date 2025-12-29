@@ -239,10 +239,18 @@ bool wican_connect(wican_context_t *ctx, const char *ip_address, uint16_t port)
     OutputDebugStringA("[WICAN] wican_connect: connection established, configuring socket\n");
     set_socket_nonblocking(ctx->socket, false);
     set_socket_timeouts(ctx->socket, WICAN_READ_TIMEOUT_MS, 1000);
-    
+
     int flag = 1;
     setsockopt(ctx->socket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
     
+    /* Increase socket buffer sizes for better throughput during ECU reprogramming.
+     * Default Windows buffers are ~8KB, which can cause bottlenecks when receiving
+     * large ISO-TP responses or sending rapid consecutive frames. 64KB provides
+     * headroom for WiFi latency variations without blocking. */
+    int buf_size = 65536;  /* 64KB */
+    setsockopt(ctx->socket, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
+    setsockopt(ctx->socket, SOL_SOCKET, SO_SNDBUF, (char*)&buf_size, sizeof(buf_size));
+
     ctx->transport_type = WICAN_TRANSPORT_TCP;
     ctx->connected = true;
     return true;
