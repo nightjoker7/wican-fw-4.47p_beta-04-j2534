@@ -127,10 +127,10 @@ j2534_error_t j2534_read_msgs(uint32_t channel_id, j2534_msg_t *msgs,
         j2534_rx_msg_head = 0;
         j2534_rx_msg_tail = 0;
 
-        // Reset ISO-TP state machines
+        // Reset ISO-TP state machines (using safe reset to preserve PSRAM buffers)
         memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
-        memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
-        memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+        j2534_reset_isotp_tx_state();
+        j2534_reset_isotp_rx_state();
     }
 
     uint32_t requested = *num_msgs;
@@ -240,10 +240,10 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
         j2534_rx_msg_head = 0;
         j2534_rx_msg_tail = 0;
 
-        // Reset ISO-TP state
+        // Reset ISO-TP state (using safe reset to preserve PSRAM buffers)
         memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
-        memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
-        memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+        j2534_reset_isotp_tx_state();
+        j2534_reset_isotp_rx_state();
 
         ch->iso15765_ext_addr = false;
         ch->iso15765_ext_addr_byte = 0;

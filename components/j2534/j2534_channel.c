@@ -268,10 +268,10 @@ j2534_error_t j2534_disconnect(uint32_t channel_id)
         }
     }
 
-    // Reset ISO-TP state
+    // Reset ISO-TP state (using safe reset to preserve PSRAM buffers)
     memset((void*)&isotp_fc_state, 0, sizeof(isotp_fc_state));
-    memset((void*)&isotp_tx_state, 0, sizeof(isotp_tx_state));
-    memset((void*)&isotp_rx_state, 0, sizeof(isotp_rx_state));
+    j2534_reset_isotp_tx_state();
+    j2534_reset_isotp_rx_state();
 
     // Clear filters
     memset(ch->filters, 0, sizeof(ch->filters));

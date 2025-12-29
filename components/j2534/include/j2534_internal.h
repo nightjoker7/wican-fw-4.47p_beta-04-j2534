@@ -216,6 +216,10 @@ void isotp_buffer_complete_message(j2534_channel_t *ch, uint32_t can_id, uint8_t
 void j2534_process_can_frame(twai_message_t *frame);
 j2534_error_t j2534_send_isotp_message(j2534_channel_t *ch, uint32_t can_id, uint8_t *data, uint32_t data_len, bool is_extended, bool padding);
 
+// ISO-TP state reset (preserves PSRAM buffer pointers)
+void j2534_reset_isotp_rx_state(void);
+void j2534_reset_isotp_tx_state(void);
+
 // Command handler (j2534_cmd.c)
 void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_t *q);
 

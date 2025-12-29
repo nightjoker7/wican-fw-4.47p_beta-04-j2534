@@ -172,6 +172,52 @@ static void j2534_alloc_psram_buffers(void)
 }
 
 /* ============================================================================
+ * ISO-TP State Reset Functions
+ * 
+ * These functions reset ISO-TP state while PRESERVING the PSRAM buffer pointers.
+ * Direct memset() on these structs would zero out the data pointer, causing crashes.
+ * ============================================================================ */
+
+/**
+ * @brief Reset ISO-TP RX state while preserving PSRAM buffer allocation
+ * 
+ * This resets the RX state machine to idle WITHOUT destroying the data buffer pointer.
+ * Use this instead of memset(&isotp_rx_state, 0, ...) 
+ */
+void j2534_reset_isotp_rx_state(void)
+{
+    // Preserve buffer allocation
+    uint8_t *saved_data = isotp_rx_state.data;
+    uint32_t saved_size = isotp_rx_state.data_buffer_size;
+    
+    // Clear all fields
+    isotp_rx_state.active = false;
+    isotp_rx_state.can_id = 0;
+    isotp_rx_state.expected_length = 0;
+    isotp_rx_state.received_length = 0;
+    isotp_rx_state.next_seq_num = 0;
+    isotp_rx_state.flow_control_id = 0;
+    isotp_rx_state.is_extended = false;
+    isotp_rx_state.last_frame_time = 0;
+    isotp_rx_state.block_size = 0;
+    isotp_rx_state.block_count = 0;
+    
+    // Restore buffer pointers
+    isotp_rx_state.data = saved_data;
+    isotp_rx_state.data_buffer_size = saved_size;
+}
+
+/**
+ * @brief Reset ISO-TP TX state
+ */
+void j2534_reset_isotp_tx_state(void)
+{
+    isotp_tx_state.awaiting_response = false;
+    isotp_tx_state.tx_complete_time = 0;
+    isotp_tx_state.response_can_id = 0;
+}
+
+/* ============================================================================
  * Helper Functions
  * ============================================================================ */
 
