@@ -357,6 +357,7 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
     uint32_t firmware_device_id = 0;
     int retry_count = 0;
     const int max_retries = 5;  /* Increased for better reliability */
+    bool use_auto_connect = true;
     
     init_driver();
     
@@ -374,6 +375,18 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         char dbg[256];
         sprintf(dbg, "[J2534] PassThruOpen: pName='%s'\n", ip_address);
         OutputDebugStringA(dbg);
+        
+        /* Check if pName looks like a valid IP address (contains dots) */
+        bool has_dots = false;
+        for (const char *p = ip_address; *p; p++) {
+            if (*p == '.') {
+                has_dots = true;
+                break;
+            }
+        }
+        if (has_dots) {
+            use_auto_connect = false;  /* Use specified IP address */
+        }
     }
     
     device = allocate_device();
@@ -387,10 +400,20 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
     /* Retry connection with delays - WiCAN may need time to release previous connection */
     while (retry_count < max_retries) {
         char dbg[128];
-        sprintf(dbg, "[J2534] PassThruOpen: connection attempt %d/%d\n", retry_count + 1, max_retries);
+        sprintf(dbg, "[J2534] PassThruOpen: connection attempt %d/%d (auto=%d)\n", 
+                retry_count + 1, max_retries, use_auto_connect);
         OutputDebugStringA(dbg);
         
-        if (wican_connect(&device->wican_ctx, ip_address, 0)) {
+        bool connected = false;
+        if (use_auto_connect) {
+            /* Try USB first, then TCP with registry/default settings */
+            connected = wican_connect_auto(&device->wican_ctx);
+        } else {
+            /* Use specified IP address */
+            connected = wican_connect(&device->wican_ctx, ip_address, 0);
+        }
+        
+        if (connected) {
             OutputDebugStringA("[J2534] PassThruOpen: connection successful\n");
             break;  /* Connected successfully */
         }
@@ -1042,6 +1065,12 @@ long __stdcall PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Fil
                ((uint32_t)pMaskMsg->Data[1] << 16) |
                ((uint32_t)pMaskMsg->Data[2] << 8) |
                pMaskMsg->Data[3];
+    } else if (pMaskMsg && pMaskMsg->DataSize > 0) {
+        /* For legacy protocols (J1850, ISO9141), filters use 1-3 bytes */
+        mask = 0;
+        for (unsigned long i = 0; i < pMaskMsg->DataSize && i < 4; i++) {
+            mask |= ((uint32_t)pMaskMsg->Data[i] << (8 * (3 - i)));
+        }
     }
     
     if (pPatternMsg && pPatternMsg->DataSize >= 4) {
@@ -1049,6 +1078,12 @@ long __stdcall PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Fil
                   ((uint32_t)pPatternMsg->Data[1] << 16) |
                   ((uint32_t)pPatternMsg->Data[2] << 8) |
                   pPatternMsg->Data[3];
+    } else if (pPatternMsg && pPatternMsg->DataSize > 0) {
+        /* For legacy protocols (J1850, ISO9141), filters use 1-3 bytes */
+        pattern = 0;
+        for (unsigned long i = 0; i < pPatternMsg->DataSize && i < 4; i++) {
+            pattern |= ((uint32_t)pPatternMsg->Data[i] << (8 * (3 - i)));
+        }
     }
     
     /* Extract flow control TX ID for ISO 15765 */

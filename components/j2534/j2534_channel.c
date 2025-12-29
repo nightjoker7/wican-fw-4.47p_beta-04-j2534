@@ -165,15 +165,20 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
 #if HARDWARE_VER == WICAN_PRO
     if (is_legacy_protocol) {
         // Initialize OBD chip bridge if needed
-        if (stn_j2534_init() != ESP_OK) {
+        esp_err_t init_err = stn_j2534_init();
+        if (init_err != ESP_OK) {
+            ch->active = false;  // Free the channel on failure
             j2534_set_error(J2534_ERR_FAILED, "OBD chip not ready");
+            ESP_LOGE(TAG, "stn_j2534_init() failed with error %d", init_err);
             return J2534_ERR_FAILED;
         }
 
         // Select protocol on OBD chip
         stn_j2534_status_t status = stn_j2534_select_protocol(stn_proto);
         if (status != STN_J2534_STATUS_OK) {
+            ch->active = false;  // Free the channel on failure
             j2534_set_error(J2534_ERR_FAILED, "Failed to select protocol on OBD chip");
+            ESP_LOGE(TAG, "stn_j2534_select_protocol() failed with status %d", status);
             return J2534_ERR_FAILED;
         }
 
@@ -362,14 +367,22 @@ j2534_error_t j2534_start_msg_filter(uint32_t channel_id,
     filter->protocol_id = ch->protocol_id;
     filter->active = true;
 
-    // Copy mask (first 4 bytes of data are CAN ID)
+    // Copy mask (first 4 bytes of data are CAN ID or header bytes for legacy)
     if (mask_msg && mask_msg->data_size >= 4) {
         memcpy(filter->mask, mask_msg->data, 4);
+    } else if (mask_msg && mask_msg->data_size > 0) {
+        // Legacy protocol - copy whatever bytes we have
+        memset(filter->mask, 0, 4);
+        memcpy(filter->mask, mask_msg->data, mask_msg->data_size);
     }
 
     // Copy pattern
     if (pattern_msg && pattern_msg->data_size >= 4) {
         memcpy(filter->pattern, pattern_msg->data, 4);
+    } else if (pattern_msg && pattern_msg->data_size > 0) {
+        // Legacy protocol - copy whatever bytes we have
+        memset(filter->pattern, 0, 4);
+        memcpy(filter->pattern, pattern_msg->data, pattern_msg->data_size);
     }
 
     // Copy flow control (for ISO15765)
@@ -383,6 +396,22 @@ j2534_error_t j2534_start_msg_filter(uint32_t channel_id,
     // Clear RX buffer when filter is set
     j2534_rx_msg_head = 0;
     j2534_rx_msg_tail = 0;
+
+#if HARDWARE_VER == WICAN_PRO
+    // For legacy protocols, apply filter to STN chip
+    // J1850_VPW=0x01, J1850_PWM=0x02, ISO9141=0x03, ISO14230=0x04
+    if (ch->protocol_id >= 0x01 && ch->protocol_id <= 0x04) {
+        uint8_t data_len = mask_msg ? mask_msg->data_size : 0;
+        if (data_len > 0 && data_len <= 4) {
+            stn_j2534_status_t stn_status = stn_j2534_set_filter(
+                filter->pattern, filter->mask, data_len);
+            if (stn_status != STN_J2534_STATUS_OK) {
+                ESP_LOGW(TAG, "STN filter setup returned %d (non-fatal)", stn_status);
+                // Don't fail - STN might not support CRA for all protocols
+            }
+        }
+    }
+#endif
 
     ESP_LOGI(TAG, "Started filter %lu on channel %lu", fid, channel_id);
     return J2534_STATUS_NOERROR;

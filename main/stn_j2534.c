@@ -162,7 +162,11 @@ static stn_j2534_status_t stn_j2534_send_cmd(const char* cmd, char* response,
         if (strstr(response, "NO DATA")) {
             return STN_J2534_STATUS_NO_DATA;
         }
-        if (strstr(response, "BUS ERROR") || strstr(response, "BUS INIT")) {
+        // Note: "BUS INIT: OK" is success, "BUS INIT: ...ERROR" is failure
+        if (strstr(response, "BUS INIT") && strstr(response, "ERROR")) {
+            return STN_J2534_STATUS_BUS_ERROR;
+        }
+        if (strstr(response, "BUS ERROR")) {
             return STN_J2534_STATUS_BUS_ERROR;
         }
         if (strstr(response, "UNABLE TO CONNECT")) {
@@ -238,11 +242,27 @@ esp_err_t stn_j2534_init(void)
         return ESP_OK;
     }
     
-    // Check if OBD chip is ready
+    // Wait for OBD chip to be ready (may need to wake from sleep)
+    // The chip signals ready via GPIO - wait up to 3 seconds
+    int retry_count = 0;
+    const int max_retries = 30;  // 30 x 100ms = 3 seconds
+    
+    ESP_LOGI(TAG, "Waiting for STN chip to be ready...");
+    
+    while (elm327_chip_get_status() != ELM327_READY && retry_count < max_retries) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        retry_count++;
+        if (retry_count % 10 == 0) {
+            ESP_LOGI(TAG, "Still waiting for STN chip... (%d/%d)", retry_count, max_retries);
+        }
+    }
+    
     if (elm327_chip_get_status() != ELM327_READY) {
-        ESP_LOGE(TAG, "STN chip not ready");
+        ESP_LOGE(TAG, "STN chip not ready after %d ms", retry_count * 100);
         return ESP_ERR_INVALID_STATE;
     }
+    
+    ESP_LOGI(TAG, "STN chip ready after %d ms", retry_count * 100);
     
     // Reset to defaults
     stn_j2534_status_t status = stn_j2534_reset();
@@ -302,6 +322,8 @@ stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
     char response[128];
     stn_j2534_status_t status;
     
+    ESP_LOGI(TAG, "Selecting protocol %d", protocol);
+    
     // Special handling for GM Class 2 UART (8192 baud)
     if (protocol == STN_PROTO_GM_UART) {
         ESP_LOGI(TAG, "Initializing GM Class 2 UART protocol");
@@ -340,6 +362,88 @@ stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
         return STN_J2534_STATUS_OK;
     }
     
+    // J1850 VPW specific setup (Class 2 Serial)
+    if (protocol == STN_PROTO_J1850VPW) {
+        ESP_LOGI(TAG, "Initializing J1850 VPW (Class 2 Serial) protocol");
+        
+        // Reset to defaults first
+        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Select protocol 2 (J1850 VPW 10.4 kbaud)
+        status = stn_j2534_send_cmd("ATSP2\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK) {
+            ESP_LOGE(TAG, "ATSP2 failed: %s", response);
+            return STN_J2534_STATUS_PROTOCOL_ERROR;
+        }
+        
+        // Enable headers - J2534 needs full message with header bytes
+        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Disable spaces for cleaner parsing
+        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Disable echo
+        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Allow long messages (up to 256 bytes)
+        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set default timeout (ATST in 4ms units, 0xFF = 1020ms)
+        stn_j2534_send_cmd("ATST FF\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Try STN-specific command for millisecond timeout
+        stn_j2534_send_cmd("STPTO 1000\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Disable adaptive timing - use fixed timing for J2534 compliance
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set default J1850 header (functional broadcast to BCM)
+        stn_j2534_send_cmd("ATSH686AF1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Try to wake up the bus by sending a test message (TesterPresent)
+        // This helps ensure the bus is actually active
+        ESP_LOGI(TAG, "Attempting bus initialization...");
+        status = stn_j2534_send_cmd("3F00\r", response, sizeof(response), 5000);
+        if (status == STN_J2534_STATUS_NO_DATA) {
+            // No response is OK for TesterPresent - bus may be active
+            ESP_LOGI(TAG, "No response to bus init (expected for some ECUs)");
+        } else if (status != STN_J2534_STATUS_OK) {
+            ESP_LOGW(TAG, "Bus init response: %s", response);
+        } else {
+            ESP_LOGI(TAG, "Bus init got response: %s", response);
+        }
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "J1850 VPW protocol initialized successfully");
+        return STN_J2534_STATUS_OK;
+    }
+    
+    // J1850 PWM specific setup
+    if (protocol == STN_PROTO_J1850PWM) {
+        ESP_LOGI(TAG, "Initializing J1850 PWM protocol");
+        
+        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        status = stn_j2534_send_cmd("ATSP1\r", response, sizeof(response), 
+                                     STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK || !strstr(response, "OK")) {
+            ESP_LOGE(TAG, "ATSP1 failed: %s", response);
+            return STN_J2534_STATUS_PROTOCOL_ERROR;
+        }
+        
+        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATST FF\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "J1850 PWM protocol initialized successfully");
+        return STN_J2534_STATUS_OK;
+    }
+    
     // Build ATSP command for standard protocols
     if (protocol <= 9) {
         snprintf(cmd, sizeof(cmd), "ATSP%d\r", protocol);
@@ -358,6 +462,7 @@ stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
         return STN_J2534_STATUS_OK;
     }
     
+    ESP_LOGE(TAG, "Protocol selection failed: %s", response);
     return status;
 }
 
@@ -397,7 +502,7 @@ stn_j2534_status_t stn_j2534_set_filter(const uint8_t *filter, const uint8_t *ma
     char response[128];
     stn_j2534_status_t status;
     
-    if (len < 2 || len > 4) {
+    if (len < 1 || len > 4) {
         return STN_J2534_STATUS_CHIP_ERROR;
     }
     
@@ -406,14 +511,17 @@ stn_j2534_status_t stn_j2534_set_filter(const uint8_t *filter, const uint8_t *ma
     memcpy(s_config.rx_mask, mask, len);
     
     // Set receive address (CRA for filtering)
-    if (len == 3) {
+    // For J1850 VPW, only 1 byte header is used
+    if (len == 1) {
+        snprintf(cmd, sizeof(cmd), "ATCRA%02X\r", filter[0]);
+    } else if (len == 2) {
+        snprintf(cmd, sizeof(cmd), "ATCRA%02X%02X\r", filter[0], filter[1]);
+    } else if (len == 3) {
         snprintf(cmd, sizeof(cmd), "ATCRA%02X%02X%02X\r", 
                  filter[0], filter[1], filter[2]);
-    } else if (len == 4) {
+    } else {
         snprintf(cmd, sizeof(cmd), "ATCRA%02X%02X%02X%02X\r", 
                  filter[0], filter[1], filter[2], filter[3]);
-    } else {
-        snprintf(cmd, sizeof(cmd), "ATCRA%02X%02X\r", filter[0], filter[1]);
     }
     
     status = stn_j2534_send_cmd(cmd, response, sizeof(response), 
