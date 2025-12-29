@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file is part of the WiCAN project.
  *
  * Copyright (C) 2022  Meatpi Electronics.
@@ -21,7 +21,7 @@
 /**
  * @file j2534_internal.h
  * @brief Internal definitions and state structures for J2534 component
- * 
+ *
  * This header contains internal types, state structures, and shared variables
  * used across the J2534 component files. Not intended for external use.
  */
@@ -38,6 +38,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "esp_heap_caps.h"
 #include "driver/twai.h"
 #include "j2534.h"
 
@@ -51,12 +52,25 @@ extern "C" {
 
 #define J2534_TAG "J2534"
 
-// RX message buffer for received CAN frames
-// 32 messages × ~280 bytes = ~9KB - reasonable for ESP32-S3
-#define J2534_RX_MSG_BUFFER_SIZE 32
+/* ============================================================================
+ * PSRAM-backed buffer sizes for improved ECU programming performance
+ * 
+ * WiCAN Pro has 8MB PSRAM which allows much larger buffers:
+ * - Larger RX buffer reduces message drops during fast ECU responses
+ * - Larger ISO-TP reassembly handles bigger diagnostic responses
+ * ============================================================================ */
+
+// RX message buffer - PSRAM allows 128 messages for ECU programming
+// Each message is ~280 bytes = ~36KB total (easily fits in PSRAM)
+#define J2534_RX_MSG_BUFFER_SIZE 128
 
 // Maximum periodic messages active at once
 #define J2534_MAX_PERIODIC_MSGS_ACTIVE 8
+
+// ISO-TP reassembly buffer size (max size for large diagnostic responses)
+// Some ECUs send very large responses (calibration readout, DTC snapshots)
+// 8KB covers all standard use cases
+#define J2534_ISOTP_RX_BUFFER_SIZE 8192
 
 /* ============================================================================
  * Flow Control State (for multi-frame TX synchronization with RX task)
@@ -74,6 +88,8 @@ typedef struct {
 /* ============================================================================
  * ISO-TP Multi-frame RX State
  * NOTE: Accessed from multiple tasks (CAN RX task and J2534 command task)
+ * 
+ * The data buffer is now allocated in PSRAM for larger capacity
  * ============================================================================ */
 
 typedef struct {
@@ -82,7 +98,8 @@ typedef struct {
     volatile uint32_t expected_length;  // Total expected data length
     volatile uint32_t received_length;  // Data received so far
     uint8_t next_seq_num;               // Next expected sequence number
-    uint8_t data[4128];                 // ISO-TP max data size (4095 + padding)
+    uint8_t *data;                      // PSRAM-allocated data buffer (J2534_ISOTP_RX_BUFFER_SIZE)
+    uint32_t data_buffer_size;          // Actual allocated buffer size
     uint32_t flow_control_id;           // CAN ID for Flow Control response
     bool is_extended;                   // Extended CAN ID flag
     TickType_t last_frame_time;         // Timestamp of last frame
@@ -114,6 +131,19 @@ typedef struct {
 } j2534_periodic_msg_t;
 
 /* ============================================================================
+ * PSRAM Buffer Management
+ * ============================================================================ */
+
+// Flag indicating PSRAM buffers were successfully allocated
+extern bool j2534_psram_available;
+
+// PSRAM-allocated RX message buffer (NULL if PSRAM not available, falls back to static)
+extern j2534_msg_t *j2534_rx_msg_buffer;
+
+// Actual RX buffer size (may differ from J2534_RX_MSG_BUFFER_SIZE if PSRAM unavailable)
+extern uint32_t j2534_rx_msg_buffer_actual_size;
+
+/* ============================================================================
  * Extern Declarations for Shared State Variables
  * These are defined in j2534_core.c
  * ============================================================================ */
@@ -136,8 +166,7 @@ extern uint32_t j2534_rx_index;
 extern uint8_t j2534_parse_state;
 extern uint16_t j2534_expected_len;
 
-// RX message buffer
-extern j2534_msg_t j2534_rx_msg_buffer[J2534_RX_MSG_BUFFER_SIZE];
+// RX message buffer head/tail
 extern volatile uint32_t j2534_rx_msg_head;
 extern volatile uint32_t j2534_rx_msg_tail;
 

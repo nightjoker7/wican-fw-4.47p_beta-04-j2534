@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file is part of the WiCAN project.
  *
  * Copyright (C) 2022  Meatpi Electronics.
@@ -52,7 +52,7 @@
  */
 void j2534_buffer_tx_indication(j2534_msg_t *orig_msg, uint32_t protocol_id)
 {
-    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
     if (next_head == j2534_rx_msg_tail) {
         ESP_LOGW(TAG, "TX indication: RX buffer full, dropping echo");
         return;
@@ -147,7 +147,7 @@ j2534_error_t j2534_read_msgs(uint32_t channel_id, j2534_msg_t *msgs,
         if (j2534_rx_msg_head != j2534_rx_msg_tail) {
             memcpy(&msgs[read_count], &j2534_rx_msg_buffer[j2534_rx_msg_tail],
                    sizeof(j2534_msg_t));
-            j2534_rx_msg_tail = (j2534_rx_msg_tail + 1) % J2534_RX_MSG_BUFFER_SIZE;
+            j2534_rx_msg_tail = (j2534_rx_msg_tail + 1) % j2534_rx_msg_buffer_actual_size;
 
             // Clear awaiting state if we received actual response (not TX echo)
             if ((msgs[read_count].rx_status & 0x01) == 0) {
@@ -278,7 +278,7 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
 
                 // Buffer responses as RX messages
                 for (uint32_t r = 0; r < num_responses; r++) {
-                    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+                    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
                     if (next_head != j2534_rx_msg_tail) {
                         j2534_msg_t *rx_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
                         memset(rx_msg, 0, sizeof(j2534_msg_t));

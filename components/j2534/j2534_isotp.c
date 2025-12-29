@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file j2534_isotp.c
  * @brief J2534 ISO-TP (ISO 15765-2) frame handling
  *
@@ -87,7 +87,7 @@ void isotp_send_flow_control(j2534_channel_t *ch, uint32_t tx_id, bool is_extend
 void isotp_buffer_complete_message(j2534_channel_t *ch, uint32_t can_id,
                                           uint8_t *data, uint32_t data_len, bool is_extended)
 {
-    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
     if (next_head == j2534_rx_msg_tail) {
         ESP_LOGW(TAG, "ISO-TP: RX buffer full!");
         return;
@@ -405,7 +405,7 @@ int32_t j2534_can_to_msg(twai_message_t *frame, uint8_t *output_buf)
                 uint32_t remaining = isotp_rx_state.expected_length - isotp_rx_state.received_length;
                 uint32_t cf_data_len = (remaining > (7 - pci_offset)) ? (7 - pci_offset) : remaining;
 
-                if (isotp_rx_state.received_length + cf_data_len <= sizeof(isotp_rx_state.data)) {
+                if (isotp_rx_state.received_length + cf_data_len <= isotp_rx_state.data_buffer_size) {
                     memcpy((uint8_t*)&isotp_rx_state.data[isotp_rx_state.received_length],
                            &frame->data[pci_offset + 1], cf_data_len);
                     isotp_rx_state.received_length += cf_data_len;
@@ -465,7 +465,7 @@ buffer_message:
     // Non-ISO-TP or raw CAN - buffer as-is
     ESP_LOGI(TAG, "j2534_can_to_msg: BUFFERED frame ID=0x%lX", frame->identifier);
 
-    uint32_t next_head = (j2534_rx_msg_head + 1) % J2534_RX_MSG_BUFFER_SIZE;
+    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
     if (next_head == j2534_rx_msg_tail) {
         ESP_LOGW(TAG, "j2534_can_to_msg: RX buffer full!");
         return 0;

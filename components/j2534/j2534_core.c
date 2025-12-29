@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file is part of the WiCAN project.
  *
  * Copyright (C) 2022  Meatpi Electronics.
@@ -21,13 +21,14 @@
 /**
  * @file j2534_core.c
  * @brief J2534 Core - Global variables, initialization, device management
- * 
+ *
  * This file contains:
  * - Global state variables (defined here, extern in j2534_internal.h)
  * - Initialization and reset functions
  * - Device open/close functions
  * - Helper functions used across the component
  * - Periodic message task
+ * - PSRAM buffer allocation for improved ECU programming performance
  */
 
 #include "j2534_internal.h"
@@ -62,8 +63,28 @@ uint32_t j2534_rx_index = 0;
 uint8_t j2534_parse_state = 0;
 uint16_t j2534_expected_len = 0;
 
-// RX message buffer
-j2534_msg_t j2534_rx_msg_buffer[J2534_RX_MSG_BUFFER_SIZE];
+/* ============================================================================
+ * PSRAM Buffer Management
+ * 
+ * WiCAN Pro has 8MB PSRAM at 80MHz which enables much larger buffers for
+ * ECU reprogramming operations. Buffers are dynamically allocated in PSRAM
+ * if available, with fallback to static allocation in internal RAM.
+ * ============================================================================ */
+
+// PSRAM availability flag
+bool j2534_psram_available = false;
+
+// PSRAM-allocated RX message buffer (pointer, dynamically allocated)
+j2534_msg_t *j2534_rx_msg_buffer = NULL;
+
+// Fallback static buffer for when PSRAM isn't available (smaller size)
+#define J2534_RX_MSG_BUFFER_SIZE_FALLBACK 32
+static j2534_msg_t j2534_rx_msg_buffer_static[J2534_RX_MSG_BUFFER_SIZE_FALLBACK];
+
+// Actual buffer size (depends on PSRAM availability)
+uint32_t j2534_rx_msg_buffer_actual_size = 0;
+
+// RX message buffer indices
 volatile uint32_t j2534_rx_msg_head = 0;
 volatile uint32_t j2534_rx_msg_tail = 0;
 
@@ -75,9 +96,80 @@ j2534_periodic_msg_t j2534_periodic_msgs[J2534_MAX_PERIODIC_MSGS_ACTIVE];
 uint32_t j2534_next_periodic_id = 1;
 TaskHandle_t j2534_periodic_task_handle = NULL;
 
-// ISO-TP state
+// ISO-TP state - data buffer is PSRAM-allocated in init
 volatile isotp_rx_state_t isotp_rx_state = {0};
 volatile isotp_tx_state_t isotp_tx_state = {0};
+
+// Fallback static ISO-TP buffer (4KB if PSRAM unavailable)
+static uint8_t isotp_rx_data_static[4128];
+
+/* ============================================================================
+ * PSRAM Allocation Helper
+ * ============================================================================ */
+
+/**
+ * @brief Allocate PSRAM buffers for J2534
+ * 
+ * Attempts to allocate large buffers in PSRAM for improved ECU programming
+ * performance. Falls back to smaller static buffers if PSRAM unavailable.
+ */
+static void j2534_alloc_psram_buffers(void)
+{
+    // Check if PSRAM is available
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    
+    if (psram_size > 0) {
+        ESP_LOGI(TAG, "PSRAM detected: %zu bytes total", psram_size);
+        
+        // Allocate RX message buffer in PSRAM (128 messages * ~280 bytes = ~36KB)
+        size_t rx_buf_size = J2534_RX_MSG_BUFFER_SIZE * sizeof(j2534_msg_t);
+        j2534_rx_msg_buffer = (j2534_msg_t*)heap_caps_malloc(rx_buf_size, MALLOC_CAP_SPIRAM);
+        
+        if (j2534_rx_msg_buffer) {
+            memset(j2534_rx_msg_buffer, 0, rx_buf_size);
+            j2534_rx_msg_buffer_actual_size = J2534_RX_MSG_BUFFER_SIZE;
+            ESP_LOGI(TAG, "PSRAM: Allocated %zu bytes for RX message buffer (%d msgs)", 
+                     rx_buf_size, J2534_RX_MSG_BUFFER_SIZE);
+        } else {
+            ESP_LOGW(TAG, "PSRAM: Failed to allocate RX buffer, using static fallback");
+            j2534_rx_msg_buffer = j2534_rx_msg_buffer_static;
+            j2534_rx_msg_buffer_actual_size = J2534_RX_MSG_BUFFER_SIZE_FALLBACK;
+        }
+        
+        // Allocate ISO-TP reassembly buffer in PSRAM (8KB for large responses)
+        uint8_t *isotp_data = (uint8_t*)heap_caps_malloc(J2534_ISOTP_RX_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        
+        if (isotp_data) {
+            memset(isotp_data, 0, J2534_ISOTP_RX_BUFFER_SIZE);
+            isotp_rx_state.data = isotp_data;
+            isotp_rx_state.data_buffer_size = J2534_ISOTP_RX_BUFFER_SIZE;
+            ESP_LOGI(TAG, "PSRAM: Allocated %d bytes for ISO-TP RX buffer", J2534_ISOTP_RX_BUFFER_SIZE);
+        } else {
+            ESP_LOGW(TAG, "PSRAM: Failed to allocate ISO-TP buffer, using static fallback");
+            isotp_rx_state.data = isotp_rx_data_static;
+            isotp_rx_state.data_buffer_size = sizeof(isotp_rx_data_static);
+        }
+        
+        j2534_psram_available = (j2534_rx_msg_buffer != j2534_rx_msg_buffer_static);
+        
+        // Log remaining PSRAM
+        size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG, "PSRAM: %zu bytes remaining after J2534 allocation", psram_free);
+        
+    } else {
+        ESP_LOGI(TAG, "PSRAM not available, using static buffers");
+        j2534_rx_msg_buffer = j2534_rx_msg_buffer_static;
+        j2534_rx_msg_buffer_actual_size = J2534_RX_MSG_BUFFER_SIZE_FALLBACK;
+        isotp_rx_state.data = isotp_rx_data_static;
+        isotp_rx_state.data_buffer_size = sizeof(isotp_rx_data_static);
+        j2534_psram_available = false;
+    }
+    
+    ESP_LOGI(TAG, "J2534 buffers: RX msgs=%lu (PSRAM=%s), ISO-TP=%lu bytes",
+             j2534_rx_msg_buffer_actual_size,
+             j2534_psram_available ? "yes" : "no",
+             isotp_rx_state.data_buffer_size);
+}
 
 /* ============================================================================
  * Helper Functions
@@ -304,6 +396,9 @@ void j2534_init(void (*send_callback)(char*, uint32_t, QueueHandle_t *q, char* c
     j2534_response = send_callback;
     j2534_rx_queue = rx_queue;
 
+    // Allocate PSRAM buffers if available
+    j2534_alloc_psram_buffers();
+
     // Initialize channels
     memset(j2534_channels, 0, sizeof(j2534_channels));
     for (int i = 0; i < J2534_MAX_CHANNELS; i++) {
@@ -327,7 +422,7 @@ void j2534_init(void (*send_callback)(char*, uint32_t, QueueHandle_t *q, char* c
 
     j2534_set_error(J2534_STATUS_NOERROR, NULL);
 
-    ESP_LOGI(TAG, "J2534 module initialized");
+    ESP_LOGI(TAG, "J2534 module initialized (PSRAM=%s)", j2534_psram_available ? "enabled" : "disabled");
 }
 
 j2534_error_t j2534_open(uint32_t *device_id)
@@ -340,7 +435,8 @@ j2534_error_t j2534_open(uint32_t *device_id)
     j2534_device_open = true;
     *device_id = j2534_device_id;
 
-    ESP_LOGI(TAG, "Device opened, ID: %lu", j2534_device_id);
+    ESP_LOGI(TAG, "Device opened, ID: %lu (PSRAM buffers: RX=%lu msgs, ISO-TP=%lu bytes)",
+             j2534_device_id, j2534_rx_msg_buffer_actual_size, isotp_rx_state.data_buffer_size);
     return J2534_STATUS_NOERROR;
 }
 
