@@ -1,24 +1,9 @@
 Windows Registry Editor Version 5.00
 
-; WiCAN J2534 Driver Registration
-; Run as Administrator to install
+; WiCAN J2534 Driver Registration Fix for GM SPS
+; Right-click and select "Run as Administrator" to install
 
-[HKEY_LOCAL_MACHINE\SOFTWARE\PassThruSupport.04.04\MeatPi - WiCAN]
-"Name"="MeatPi - WiCAN"
-"Vendor"="MeatPi Electronics"
-"ConfigApplication"=""
-"FunctionLibrary"="C:\\Program Files\\WiCAN\\wican_j2534_32.dll"
-"ProtocolsSupported"="CAN:ISO15765:J1850VPW:J1850PWM:ISO9141:ISO14230"
-"CAN"=dword:00000001
-"ISO15765"=dword:00000001
-"J1850VPW"=dword:00000001
-"J1850PWM"=dword:00000001
-"ISO9141"=dword:00000001
-"ISO14230"=dword:00000001
-"IPAddress"="192.168.80.1"
-"Port"=dword:00008898
-
-; 32-bit registry (for 64-bit Windows running 32-bit apps)
+; Update 32-bit registry (for 64-bit Windows running 32-bit apps like GM SPS)
 [HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\PassThruSupport.04.04\MeatPi - WiCAN]
 "Name"="MeatPi - WiCAN"
 "Vendor"="MeatPi Electronics"
@@ -31,5 +16,21 @@ Windows Registry Editor Version 5.00
 "J1850PWM"=dword:00000001
 "ISO9141"=dword:00000001
 "ISO14230"=dword:00000001
-"IPAddress"="192.168.80.1"
-"Port"=dword:00008898
+"IPAddress"="192.168.0.24"
+"Port"=dword:00000d05
+
+; Also update the native 64-bit registry
+[HKEY_LOCAL_MACHINE\SOFTWARE\PassThruSupport.04.04\MeatPi - WiCAN]
+"Name"="MeatPi - WiCAN"
+"Vendor"="MeatPi Electronics"
+"ConfigApplication"=""
+"FunctionLibrary"="C:\\Program Files\\WiCAN\\wican_j2534_64.dll"
+"ProtocolsSupported"="CAN:ISO15765:J1850VPW:J1850PWM:ISO9141:ISO14230"
+"CAN"=dword:00000001
+"ISO15765"=dword:00000001
+"J1850VPW"=dword:00000001
+"J1850PWM"=dword:00000001
+"ISO9141"=dword:00000001
+"ISO14230"=dword:00000001
+"IPAddress"="192.168.0.24"
+"Port"=dword:00000d05

@@ -274,6 +274,23 @@ static void can_tx_task(void *pvParameters)
 		uint8_t* msg_ptr = ucTCP_RX_Buffer.ucElement;
 		int temp_len = ucTCP_RX_Buffer.usLen;
 
+		// Check for J2534 packets FIRST (sync bytes 0x55 0xAA) before other protocols
+		// This prevents ELM327 or other handlers from sending error responses for J2534 binary packets
+		bool is_j2534_packet = (temp_len >= 2 && msg_ptr[0] == 0x55 && msg_ptr[1] == 0xAA);
+		if (is_j2534_packet)
+		{
+			ESP_LOGI(TAG, "J2534 packet detected (sync 0x55 0xAA), len=%d", temp_len);
+			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
+			{
+				j2534_process(msg_ptr, temp_len, &tx_msg, &xMsg_Tx_Queue);
+			}
+			else if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
+			{
+				j2534_process(msg_ptr, temp_len, &tx_msg, &xmsg_ble_tx_queue);
+			}
+			continue;  // Skip other protocol handlers for J2534 packets
+		}
+
 		if(config_server_ws_connected())
 		{
 			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI_WS)
@@ -359,21 +376,8 @@ static void can_tx_task(void *pvParameters)
 				j2534_process(msg_ptr, temp_len, &tx_msg, &xmsg_ble_tx_queue);
 			}
 		}
-		
-		// Auto-detect J2534 packets by sync bytes (0x55 0xAA) regardless of configured protocol
-		// This allows J2534 DLL to work even when device is configured for other protocols like ELM327
-		if (protocol != J2534_PROTO && temp_len >= 2 && msg_ptr[0] == 0x55 && msg_ptr[1] == 0xAA)
-		{
-			ESP_LOGI(TAG, "J2534 packet auto-detected (sync 0x55 0xAA)");
-			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
-			{
-				j2534_process(msg_ptr, temp_len, &tx_msg, &xMsg_Tx_Queue);
-			}
-			else if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
-			{
-				j2534_process(msg_ptr, temp_len, &tx_msg, &xmsg_ble_tx_queue);
-			}
-		}
+		// Note: J2534 auto-detect moved to beginning of loop with 'continue' to prevent
+		// other protocol handlers from processing J2534 binary packets
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
