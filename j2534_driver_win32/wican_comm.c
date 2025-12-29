@@ -771,16 +771,32 @@ bool wican_device_open(wican_context_t *ctx, uint32_t *device_id)
     uint16_t resp_len = sizeof(resp_data);
     uint8_t resp_cmd, resp_status;
     
+    OutputDebugStringA("[WICAN] wican_device_open: sending OPEN command\n");
+    
     /* Send OPEN command with no data */
     if (!wican_send_command(ctx, WICAN_CMD_OPEN, NULL, 0)) {
+        OutputDebugStringA("[WICAN] wican_device_open: wican_send_command failed\n");
         return false;
     }
     
+    OutputDebugStringA("[WICAN] wican_device_open: waiting for response (2000ms timeout)\n");
+    
     if (!wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, 2000)) {
+        OutputDebugStringA("[WICAN] wican_device_open: wican_receive_response failed (timeout or bad packet)\n");
         return false;
+    }
+    
+    {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_device_open: resp_cmd=0x%02X resp_status=0x%02X resp_len=%u\n",
+                resp_cmd, resp_status, resp_len);
+        OutputDebugStringA(dbg);
     }
     
     if (resp_status != WICAN_RESP_OK) {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_device_open: device returned error status 0x%02X\n", resp_status);
+        OutputDebugStringA(dbg);
         return false;
     }
     
@@ -789,6 +805,10 @@ bool wican_device_open(wican_context_t *ctx, uint32_t *device_id)
         *device_id = ((uint32_t)resp_data[0] << 24) | ((uint32_t)resp_data[1] << 16) |
                      ((uint32_t)resp_data[2] << 8) | resp_data[3];
         ctx->device_id = *device_id;
+        
+        char dbg[128];
+        sprintf(dbg, "[WICAN] wican_device_open: SUCCESS, device_id=%lu\n", *device_id);
+        OutputDebugStringA(dbg);
     }
     
     return true;

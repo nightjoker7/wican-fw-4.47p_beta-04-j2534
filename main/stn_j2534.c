@@ -242,27 +242,43 @@ esp_err_t stn_j2534_init(void)
         return ESP_OK;
     }
     
-    // Wait for OBD chip to be ready (may need to wake from sleep)
-    // The chip signals ready via GPIO - wait up to 3 seconds
-    int retry_count = 0;
-    const int max_retries = 30;  // 30 x 100ms = 3 seconds
+    ESP_LOGI(TAG, "Initializing STN chip for J2534...");
     
-    ESP_LOGI(TAG, "Waiting for STN chip to be ready...");
+    // First, ensure the chip is awake by setting SLEEP pin high
+    gpio_set_level(OBD_SLEEP_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
     
-    while (elm327_chip_get_status() != ELM327_READY && retry_count < max_retries) {
+    // Check if chip is ready
+    if (elm327_chip_get_status() != ELM327_READY) {
+        ESP_LOGI(TAG, "STN chip not ready, performing hardware reset...");
+        
+        // Hardware reset: pull RESET low then high
+        gpio_set_level(OBD_RESET_PIN, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
-        retry_count++;
-        if (retry_count % 10 == 0) {
-            ESP_LOGI(TAG, "Still waiting for STN chip... (%d/%d)", retry_count, max_retries);
+        gpio_set_level(OBD_RESET_PIN, 1);
+        
+        // Wait for chip to come up (up to 3 seconds)
+        int retry_count = 0;
+        const int max_retries = 30;  // 30 x 100ms = 3 seconds
+        
+        while (elm327_chip_get_status() != ELM327_READY && retry_count < max_retries) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            retry_count++;
+            if (retry_count % 10 == 0) {
+                ESP_LOGI(TAG, "Waiting for STN chip... (%d/%d)", retry_count, max_retries);
+            }
+        }
+        
+        if (elm327_chip_get_status() != ELM327_READY) {
+            ESP_LOGE(TAG, "STN chip not ready after reset, GPIO7=%d", gpio_get_level(OBD_READY_PIN));
+            return ESP_ERR_INVALID_STATE;
         }
     }
     
-    if (elm327_chip_get_status() != ELM327_READY) {
-        ESP_LOGE(TAG, "STN chip not ready after %d ms", retry_count * 100);
-        return ESP_ERR_INVALID_STATE;
-    }
+    ESP_LOGI(TAG, "STN chip ready, GPIO7=%d", gpio_get_level(OBD_READY_PIN));
     
-    ESP_LOGI(TAG, "STN chip ready after %d ms", retry_count * 100);
+    // Small delay to let chip stabilize after wake
+    vTaskDelay(pdMS_TO_TICKS(100));
     
     // Reset to defaults
     stn_j2534_status_t status = stn_j2534_reset();
@@ -272,7 +288,7 @@ esp_err_t stn_j2534_init(void)
     }
     
     s_initialized = true;
-    ESP_LOGI(TAG, "STN-J2534 bridge initialized");
+    ESP_LOGI(TAG, "STN-J2534 bridge initialized successfully");
     
     return ESP_OK;
 }
