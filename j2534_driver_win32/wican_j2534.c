@@ -705,8 +705,12 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
             memcpy(can_msgs[i].data, &pMsg[i].Data[4], can_msgs[i].data_len);
         }
         
+        /* Copy all relevant TxFlags to internal flags */
         if (pMsg[i].TxFlags & CAN_29BIT_ID_TX) {
-            can_msgs[i].flags |= 0x01;
+            can_msgs[i].flags |= 0x01;  /* 29-bit CAN ID */
+        }
+        if (pMsg[i].TxFlags & ISO15765_FRAME_PAD) {
+            can_msgs[i].flags |= 0x40;  /* Frame padding */
         }
     }
     
@@ -870,7 +874,10 @@ long __stdcall PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG *p
     }
     
     if (pMsg->TxFlags & CAN_29BIT_ID_TX) {
-        can_msg.flags |= 0x01;
+        can_msg.flags |= 0x01;  /* 29-bit CAN ID */
+    }
+    if (pMsg->TxFlags & ISO15765_FRAME_PAD) {
+        can_msg.flags |= 0x40;  /* Frame padding */
     }
     
     sprintf(dbg, "[J2534] PassThruStartPeriodicMsg: CAN_ID=0x%08lX data_len=%u data=[",
