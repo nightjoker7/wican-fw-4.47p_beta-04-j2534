@@ -110,6 +110,12 @@ typedef struct {
 esp_err_t stn_j2534_init(void);
 
 /**
+ * @brief Deinitialize the STN-J2534 bridge and resume elm327_read_task
+ * @return ESP_OK on success
+ */
+esp_err_t stn_j2534_deinit(void);
+
+/**
  * @brief Select protocol on STN chip
  * @param protocol Protocol to select (STN_PROTO_xxx)
  * @return Status code

@@ -262,6 +262,8 @@ j2534_error_t j2534_disconnect(uint32_t channel_id)
     // Stop KWP keep-alive if active
     if (j2534_is_legacy_protocol(ch->protocol_id)) {
         stn_j2534_stop_keep_alive();
+        // Deinitialize STN-J2534 bridge and re-enable elm327_read_task
+        stn_j2534_deinit();
     }
 #endif
 

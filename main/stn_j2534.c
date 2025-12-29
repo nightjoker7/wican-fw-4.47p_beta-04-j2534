@@ -131,11 +131,12 @@ static stn_j2534_status_t stn_j2534_send_cmd(const char* cmd, char* response,
                                               size_t response_size, int timeout_ms)
 {
     if (!xuart1_semaphore) {
+        ESP_LOGE(TAG, "UART semaphore is NULL!");
         return STN_J2534_STATUS_CHIP_ERROR;
     }
     
     if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(STN_J2534_MUTEX_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to take UART semaphore");
+        ESP_LOGE(TAG, "Failed to take UART semaphore (timeout %dms)", STN_J2534_MUTEX_TIMEOUT_MS);
         return STN_J2534_STATUS_CHIP_ERROR;
     }
     
@@ -143,7 +144,7 @@ static stn_j2534_status_t stn_j2534_send_cmd(const char* cmd, char* response,
     uart_flush_input(STN_J2534_UART_NUM);
     
     // Send command
-    ESP_LOGD(TAG, "TX: %s", cmd);
+    ESP_LOGI(TAG, "TX: %s", cmd);
     uart_write_bytes(STN_J2534_UART_NUM, cmd, strlen(cmd));
     
     // Read response
@@ -153,10 +154,11 @@ static stn_j2534_status_t stn_j2534_send_cmd(const char* cmd, char* response,
     
     if (len > 0) {
         response[len] = '\0';
-        ESP_LOGD(TAG, "RX: %s", response);
+        ESP_LOGI(TAG, "RX: %s", response);
         
         // Check for error responses
         if (strstr(response, "?")) {
+            ESP_LOGW(TAG, "Command not understood: %s", cmd);
             return STN_J2534_STATUS_CHIP_ERROR;
         }
         if (strstr(response, "NO DATA")) {
@@ -164,18 +166,22 @@ static stn_j2534_status_t stn_j2534_send_cmd(const char* cmd, char* response,
         }
         // Note: "BUS INIT: OK" is success, "BUS INIT: ...ERROR" is failure
         if (strstr(response, "BUS INIT") && strstr(response, "ERROR")) {
+            ESP_LOGE(TAG, "Bus init error: %s", response);
             return STN_J2534_STATUS_BUS_ERROR;
         }
         if (strstr(response, "BUS ERROR")) {
+            ESP_LOGE(TAG, "Bus error: %s", response);
             return STN_J2534_STATUS_BUS_ERROR;
         }
         if (strstr(response, "UNABLE TO CONNECT")) {
+            ESP_LOGE(TAG, "Unable to connect: %s", response);
             return STN_J2534_STATUS_PROTOCOL_ERROR;
         }
         
         return STN_J2534_STATUS_OK;
     }
     
+    ESP_LOGW(TAG, "Timeout waiting for response to: %s", cmd);
     return STN_J2534_STATUS_TIMEOUT;
 }
 
@@ -244,33 +250,51 @@ esp_err_t stn_j2534_init(void)
     
     ESP_LOGI(TAG, "Initializing STN chip for J2534...");
     
+    // Check if UART semaphore is available (must be initialized by elm327_init)
+    if (!xuart1_semaphore) {
+        ESP_LOGE(TAG, "UART semaphore not initialized - elm327_init() must be called first!");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // CRITICAL: Pause elm327_read_task to prevent it from consuming UART data
+    // This must be done before any UART communication with the STN chip
+    elm327_set_stn_j2534_active(true);
+    
+    // Give elm327_read_task time to exit its loop
+    vTaskDelay(pdMS_TO_TICKS(150));
+    
     // First, ensure the chip is awake by setting SLEEP pin high
     gpio_set_level(OBD_SLEEP_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_LOGI(TAG, "Set OBD_SLEEP_PIN high, waiting for chip...");
+    vTaskDelay(pdMS_TO_TICKS(100));
     
     // Check if chip is ready
     if (elm327_chip_get_status() != ELM327_READY) {
-        ESP_LOGI(TAG, "STN chip not ready, performing hardware reset...");
+        ESP_LOGI(TAG, "STN chip not ready (GPIO7=%d), performing hardware reset...", 
+                 gpio_get_level(OBD_READY_PIN));
         
         // Hardware reset: pull RESET low then high
         gpio_set_level(OBD_RESET_PIN, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(OBD_RESET_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));  // Give chip time to boot after reset
         
-        // Wait for chip to come up (up to 3 seconds)
+        // Wait for chip to come up (up to 5 seconds)
         int retry_count = 0;
-        const int max_retries = 30;  // 30 x 100ms = 3 seconds
+        const int max_retries = 50;  // 50 x 100ms = 5 seconds
         
         while (elm327_chip_get_status() != ELM327_READY && retry_count < max_retries) {
             vTaskDelay(pdMS_TO_TICKS(100));
             retry_count++;
             if (retry_count % 10 == 0) {
-                ESP_LOGI(TAG, "Waiting for STN chip... (%d/%d)", retry_count, max_retries);
+                ESP_LOGI(TAG, "Waiting for STN chip... (%d/%d) GPIO7=%d", 
+                         retry_count, max_retries, gpio_get_level(OBD_READY_PIN));
             }
         }
         
         if (elm327_chip_get_status() != ELM327_READY) {
             ESP_LOGE(TAG, "STN chip not ready after reset, GPIO7=%d", gpio_get_level(OBD_READY_PIN));
+            elm327_set_stn_j2534_active(false);  // Re-enable elm327_read_task on failure
             return ESP_ERR_INVALID_STATE;
         }
     }
@@ -278,12 +302,13 @@ esp_err_t stn_j2534_init(void)
     ESP_LOGI(TAG, "STN chip ready, GPIO7=%d", gpio_get_level(OBD_READY_PIN));
     
     // Small delay to let chip stabilize after wake
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
     
     // Reset to defaults
     stn_j2534_status_t status = stn_j2534_reset();
     if (status != STN_J2534_STATUS_OK) {
-        ESP_LOGE(TAG, "Failed to reset STN chip");
+        ESP_LOGE(TAG, "Failed to reset STN chip, status=%d", status);
+        elm327_set_stn_j2534_active(false);  // Re-enable elm327_read_task on failure
         return ESP_FAIL;
     }
     
@@ -804,6 +829,27 @@ stn_protocol_t stn_j2534_get_protocol(void)
     return s_config.protocol;
 }
 
+esp_err_t stn_j2534_deinit(void)
+{
+    if (!s_initialized) {
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Deinitializing STN-J2534 bridge...");
+    
+    // Reset the STN chip to defaults
+    stn_j2534_reset();
+    
+    s_initialized = false;
+    
+    // Re-enable elm327_read_task
+    elm327_set_stn_j2534_active(false);
+    
+    ESP_LOGI(TAG, "STN-J2534 bridge deinitialized");
+    
+    return ESP_OK;
+}
+
 #else  // HARDWARE_VER != WICAN_PRO
 
 /* Stub implementations for non-Pro hardware */
@@ -890,6 +936,11 @@ bool stn_j2534_is_legacy_active(void)
 stn_protocol_t stn_j2534_get_protocol(void)
 {
     return STN_PROTO_AUTO;
+}
+
+esp_err_t stn_j2534_deinit(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 #endif  // HARDWARE_VER == WICAN_PRO

@@ -54,4 +54,6 @@ void elm327_unlock(void);
 void elm327_send_cmd(uint8_t* cmd, uint32_t cmd_len);
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number);
 void elm327_hardreset_chip(void);
+void elm327_set_stn_j2534_active(bool active);
+bool elm327_get_stn_j2534_active(void);
 #endif

@@ -711,29 +711,51 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     
     uint32_t num_msgs = (*pNumMsgs > 32) ? 32 : *pNumMsgs;
     
+    /* Check if this is a legacy protocol (J1850, ISO9141, ISO14230) */
+    uint32_t mapped_proto = 0;
+    protocol_type_t proto_type = get_protocol_type(channel->protocol_id, &mapped_proto);
+    bool is_legacy = (proto_type == PROTO_TYPE_J1850VPW || 
+                      proto_type == PROTO_TYPE_J1850PWM ||
+                      proto_type == PROTO_TYPE_ISO9141 ||
+                      proto_type == PROTO_TYPE_ISO14230);
+    
     /* Convert PASSTHRU_MSG to internal format */
     for (uint32_t i = 0; i < num_msgs; i++) {
         memset(&can_msgs[i], 0, sizeof(wican_can_msg_t));
         
-        can_msgs[i].can_id = ((uint32_t)pMsg[i].Data[0] << 24) |
-                             ((uint32_t)pMsg[i].Data[1] << 16) |
-                             ((uint32_t)pMsg[i].Data[2] << 8) |
-                             pMsg[i].Data[3];
-        
-        /* For ISO-TP, DataSize can be up to 4128 (4 byte CAN ID + 4124 payload) */
-        can_msgs[i].data_len = (pMsg[i].DataSize > 4) ? (pMsg[i].DataSize - 4) : 0;
-        if (can_msgs[i].data_len > 4124) can_msgs[i].data_len = 4124;  /* ISO-TP max */
-        
-        if (can_msgs[i].data_len > 0) {
-            memcpy(can_msgs[i].data, &pMsg[i].Data[4], can_msgs[i].data_len);
-        }
-        
-        /* Copy all relevant TxFlags to internal flags */
-        if (pMsg[i].TxFlags & CAN_29BIT_ID_TX) {
-            can_msgs[i].flags |= 0x01;  /* 29-bit CAN ID */
-        }
-        if (pMsg[i].TxFlags & ISO15765_FRAME_PAD) {
-            can_msgs[i].flags |= 0x40;  /* Frame padding */
+        if (is_legacy) {
+            /* Legacy protocols: Data contains raw message bytes (no CAN ID prefix)
+             * J1850VPW: [priority] [target] [source] [data...] [checksum - optional]
+             * Just copy the raw data as-is */
+            can_msgs[i].can_id = 0;  /* Not used for legacy */
+            can_msgs[i].data_len = pMsg[i].DataSize;
+            if (can_msgs[i].data_len > sizeof(can_msgs[i].data)) {
+                can_msgs[i].data_len = sizeof(can_msgs[i].data);
+            }
+            memcpy(can_msgs[i].data, pMsg[i].Data, can_msgs[i].data_len);
+            can_msgs[i].flags = 0x80;  /* Flag to indicate legacy protocol format */
+        } else {
+            /* CAN protocols: First 4 bytes are CAN ID */
+            can_msgs[i].can_id = ((uint32_t)pMsg[i].Data[0] << 24) |
+                                 ((uint32_t)pMsg[i].Data[1] << 16) |
+                                 ((uint32_t)pMsg[i].Data[2] << 8) |
+                                 pMsg[i].Data[3];
+            
+            /* For ISO-TP, DataSize can be up to 4128 (4 byte CAN ID + 4124 payload) */
+            can_msgs[i].data_len = (pMsg[i].DataSize > 4) ? (pMsg[i].DataSize - 4) : 0;
+            if (can_msgs[i].data_len > 4124) can_msgs[i].data_len = 4124;  /* ISO-TP max */
+            
+            if (can_msgs[i].data_len > 0) {
+                memcpy(can_msgs[i].data, &pMsg[i].Data[4], can_msgs[i].data_len);
+            }
+            
+            /* Copy all relevant TxFlags to internal flags */
+            if (pMsg[i].TxFlags & CAN_29BIT_ID_TX) {
+                can_msgs[i].flags |= 0x01;  /* 29-bit CAN ID */
+            }
+            if (pMsg[i].TxFlags & ISO15765_FRAME_PAD) {
+                can_msgs[i].flags |= 0x40;  /* Frame padding */
+            }
         }
     }
     

@@ -1361,6 +1361,7 @@ static StaticQueue_t elm327_cmd_queue_struct;
 static uint8_t elm327_cmd_queue_storage[ELM327_CMD_QUEUE_SIZE * sizeof(elm327_commands_t)];
 QueueHandle_t uart1_queue = NULL;
 SemaphoreHandle_t xuart1_semaphore = NULL;  // Exported for stn_j2534.c
+static volatile bool stn_j2534_active = false;  // When true, elm327_read_task skips processing
 
 // extern const unsigned char obd_fw_start[] asm("_binary_V2_3_18_txt_start");
 // extern const unsigned char obd_fw_end[]   asm("_binary_V2_3_18_txt_end");
@@ -2091,6 +2092,32 @@ void elm327_lock(void)
 void elm327_unlock(void)
 {
 	xSemaphoreGive(xuart1_semaphore);
+}
+
+/**
+ * @brief Set STN J2534 active mode - pauses elm327_read_task processing
+ * @param active true to pause elm327_read_task, false to resume
+ */
+void elm327_set_stn_j2534_active(bool active)
+{
+	stn_j2534_active = active;
+	ESP_LOGI(TAG, "STN J2534 mode: %s", active ? "ACTIVE (elm327_read_task paused)" : "INACTIVE (elm327_read_task resumed)");
+	if (active) {
+		// Flush UART and queue to clear any pending data
+		uart_flush_input(UART_NUM_1);
+		if (uart1_queue) {
+			xQueueReset(uart1_queue);
+		}
+	}
+}
+
+/**
+ * @brief Check if STN J2534 mode is active
+ * @return true if active, false otherwise
+ */
+bool elm327_get_stn_j2534_active(void)
+{
+	return stn_j2534_active;
 }
 
 void elm327_hardreset_chip(void)
@@ -3325,8 +3352,20 @@ void elm327_read_task(void *pvParameters)
     while(1) 
     {
 		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
+		
+		// Skip processing when STN J2534 mode is active
+		if (stn_j2534_active) {
+			vTaskDelay(pdMS_TO_TICKS(100));
+			continue;
+		}
+		
         if(xQueuePeek(uart1_queue, (void *)&event, portMAX_DELAY)) 
         {
+			// Double-check after waking from queue wait
+			if (stn_j2534_active) {
+				continue;
+			}
+			
 			if(xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 			{
 				bzero(dtmp.ucElement, sizeof(dtmp.ucElement));
