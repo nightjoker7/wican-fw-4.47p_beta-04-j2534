@@ -241,6 +241,86 @@ bool j2534_is_legacy_protocol(uint32_t protocol_id)
     }
 }
 
+/**
+ * @brief Check if a protocol ID is a J1850 protocol (VPW or PWM)
+ * @return true if J1850 VPW/PWM
+ */
+bool j2534_is_j1850_protocol(uint32_t protocol_id)
+{
+    switch (protocol_id) {
+        case J2534_PROTOCOL_J1850VPW:
+        case J2534_PROTOCOL_J1850PWM:
+        case J2534_PROTOCOL_J1850VPW_PS:
+        case J2534_PROTOCOL_J1850PWM_PS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Check if a protocol ID is a K-line protocol (ISO 9141 or ISO 14230)
+ * @return true if ISO 9141 or ISO 14230 (KWP2000)
+ */
+bool j2534_is_kline_protocol(uint32_t protocol_id)
+{
+    switch (protocol_id) {
+        case J2534_PROTOCOL_ISO9141:
+        case J2534_PROTOCOL_ISO14230:
+        case J2534_PROTOCOL_ISO9141_PS:
+        case J2534_PROTOCOL_ISO14230_PS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Get the header size for a legacy protocol
+ * @param protocol_id J2534 protocol ID
+ * @return Header size in bytes (3 for J1850/ISO, can vary for KWP with length byte)
+ * 
+ * Note: K-line header format depends on the format byte:
+ * - ISO 9141-2: Format + Target + Source (3 bytes), length in format byte
+ * - ISO 14230: Can have additional length byte if format byte bit 6 = 0
+ */
+uint8_t j2534_get_legacy_header_size(uint32_t protocol_id, const uint8_t *data, uint32_t data_len)
+{
+    // J1850 always has 3-byte header: Priority + Target + Source
+    if (j2534_is_j1850_protocol(protocol_id)) {
+        return 3;
+    }
+    
+    // K-line protocols: analyze format byte to determine header size
+    if (j2534_is_kline_protocol(protocol_id) && data != NULL && data_len >= 3) {
+        uint8_t format_byte = data[0];
+        
+        // ISO 14230 format byte:
+        // Bit 7: 1 = length in format byte, 0 = separate length byte
+        // Bits 5-6: Address mode (10=physical, 11=functional)
+        // Bits 0-5 (if bit 7=1): Data length
+        
+        // If format byte has bit 7 set and bits 0-5 are non-zero, length is in format byte
+        // Header = 3 bytes (format + target + source)
+        if ((format_byte & 0xC0) != 0) {
+            // Length in format byte or functional addressing
+            return 3;
+        }
+        
+        // If format byte == 0x80 exactly, there's a separate length byte
+        // Header = 4 bytes (format + target + source + length)
+        if ((format_byte & 0x3F) == 0 && data_len >= 4) {
+            return 4;
+        }
+        
+        // Default to 3-byte header
+        return 3;
+    }
+    
+    // Default: 3-byte header
+    return 3;
+}
+
 uint8_t j2534_calc_checksum(uint8_t *data, uint32_t len)
 {
     uint8_t checksum = 0;

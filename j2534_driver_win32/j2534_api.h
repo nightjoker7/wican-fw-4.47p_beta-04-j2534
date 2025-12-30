@@ -126,6 +126,12 @@ extern "C" {
 #define ADD_TO_FUNCT_MSG_LOOKUP_TABLE 0x0C
 #define DELETE_FROM_FUNCT_MSG_LOOKUP_TABLE 0x0D
 #define READ_PROG_VOLTAGE           0x0E
+/* J2534-2 Extended IOCTLs */
+#define SW_CAN_HS                   0x8000
+#define SW_CAN_NS                   0x8001
+/* WiCAN vendor-specific IOCTLs */
+#define START_KEEP_ALIVE            0x8100  /* Start TesterPresent keep-alive (input: interval_ms) */
+#define STOP_KEEP_ALIVE             0x8101  /* Stop TesterPresent keep-alive */
 
 /* ============================================================================
  * Configuration Parameter IDs (Table 5)

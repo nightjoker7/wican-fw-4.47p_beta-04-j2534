@@ -131,6 +131,9 @@ typedef enum {
     J2534_IOCTL_SW_CAN_NS           = 0x8001, // Switch to normal-speed CAN
     J2534_IOCTL_SET_POLL_RESPONSE   = 0x8002, // Set poll response
     J2534_IOCTL_BECOME_MASTER       = 0x8003, // Become master
+    // WiCAN vendor-specific IOCTLs
+    J2534_IOCTL_START_KEEP_ALIVE    = 0x8100, // Start TesterPresent keep-alive (input: interval_ms)
+    J2534_IOCTL_STOP_KEEP_ALIVE     = 0x8101, // Stop TesterPresent keep-alive
 } j2534_ioctl_t;
 
 /* ============================================================================

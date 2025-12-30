@@ -856,6 +856,132 @@ stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
         return STN_J2534_STATUS_OK;
     }
     
+    // ISO 9141-2 protocol (K-line with 5-baud init)
+    if (protocol == STN_PROTO_ISO9141) {
+        ESP_LOGI(TAG, "Initializing ISO 9141 (K-line, 5-baud init)");
+        
+        // Reset to defaults first
+        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Select protocol 3 (ISO 9141-2)
+        status = stn_j2534_send_cmd("ATSP3\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATSP3 response: [%s] status=%d", response, status);
+        if (status != STN_J2534_STATUS_OK) {
+            ESP_LOGE(TAG, "ATSP3 failed");
+            return STN_J2534_STATUS_PROTOCOL_ERROR;
+        }
+        
+        // Enable headers - J2534 needs full message with header bytes
+        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Disable spaces for cleaner parsing
+        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Disable echo
+        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Allow long messages
+        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set default K-line address (target = 0x33 = ECU)
+        // ISO 9141 header: Format + Target + Source
+        // Default format = C1 (functional addressing, physical data)
+        stn_j2534_send_cmd("ATSH C1 33 F1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "Default K-line header set: C1 33 F1");
+        
+        // Set longer timeout for K-line (300ms P2max is standard)
+        status = stn_j2534_send_cmd("STPTO 300\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK || strstr(response, "?")) {
+            // Fall back to ATST: 75 * 4ms = 300ms
+            stn_j2534_send_cmd("ATST 4B\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        }
+        
+        // Disable adaptive timing for precise J2534 control
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Note: 5-baud init will be performed via IOCTL FIVE_BAUD_INIT
+        // The protocol is set up, but bus init happens on first message or IOCTL
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "ISO 9141 protocol initialized - use FIVE_BAUD_INIT to connect");
+        return STN_J2534_STATUS_OK;
+    }
+    
+    // ISO 14230-4 KWP2000 with 5-baud init
+    if (protocol == STN_PROTO_ISO14230_5BAUD) {
+        ESP_LOGI(TAG, "Initializing ISO 14230-4 KWP2000 (5-baud init)");
+        
+        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Select protocol 4 (ISO 14230-4 KWP, 5 baud init)
+        status = stn_j2534_send_cmd("ATSP4\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATSP4 response: [%s] status=%d", response, status);
+        if (status != STN_J2534_STATUS_OK) {
+            ESP_LOGE(TAG, "ATSP4 failed");
+            return STN_J2534_STATUS_PROTOCOL_ERROR;
+        }
+        
+        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // KWP2000 header format (with length byte)
+        stn_j2534_send_cmd("ATSH C0 33 F1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set P2max timeout (300ms typical for KWP)
+        status = stn_j2534_send_cmd("STPTO 300\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK || strstr(response, "?")) {
+            stn_j2534_send_cmd("ATST 4B\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        }
+        
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "ISO 14230 (5-baud) protocol initialized - use FIVE_BAUD_INIT to connect");
+        return STN_J2534_STATUS_OK;
+    }
+    
+    // ISO 14230-4 KWP2000 with fast init
+    if (protocol == STN_PROTO_ISO14230_FAST) {
+        ESP_LOGI(TAG, "Initializing ISO 14230-4 KWP2000 (fast init)");
+        
+        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Select protocol 5 (ISO 14230-4 KWP, fast init)
+        status = stn_j2534_send_cmd("ATSP5\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATSP5 response: [%s] status=%d", response, status);
+        if (status != STN_J2534_STATUS_OK) {
+            ESP_LOGE(TAG, "ATSP5 failed");
+            return STN_J2534_STATUS_PROTOCOL_ERROR;
+        }
+        
+        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // KWP2000 default header (format byte 0xC0 = physical addressing + length byte)
+        // Target 0x33 = standard ECU diagnostic address
+        // Source 0xF1 = tester address
+        stn_j2534_send_cmd("ATSH C0 33 F1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // Set P2max timeout
+        status = stn_j2534_send_cmd("STPTO 300\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK || strstr(response, "?")) {
+            stn_j2534_send_cmd("ATST 4B\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        }
+        
+        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        
+        // For fast init, we can do the init now or wait for IOCTL
+        // Default: don't auto-init - let application control via IOCTL FAST_INIT
+        
+        s_config.protocol = protocol;
+        ESP_LOGI(TAG, "ISO 14230 (fast init) protocol initialized - use FAST_INIT IOCTL to connect");
+        return STN_J2534_STATUS_OK;
+    }
+    
     // Build ATSP command for standard protocols
     if (protocol <= 9) {
         snprintf(cmd, sizeof(cmd), "ATSP%d\r", protocol);

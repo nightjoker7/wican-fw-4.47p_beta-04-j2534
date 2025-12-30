@@ -398,6 +398,33 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
             }
             break;
 
+#if HARDWARE_VER == WICAN_PRO
+        // TesterPresent Keep-Alive - Start automatic 0x3E transmission
+        case J2534_IOCTL_START_KEEP_ALIVE:
+            {
+                uint32_t interval_ms = 2000;  // Default 2 second interval
+                if (input) {
+                    // Input is interval in milliseconds
+                    interval_ms = *((uint32_t *)input);
+                    if (interval_ms < 100) interval_ms = 100;      // Min 100ms
+                    if (interval_ms > 30000) interval_ms = 30000;  // Max 30s
+                }
+                ESP_LOGI(TAG, "IOCTL: START_KEEP_ALIVE - interval %lu ms", interval_ms);
+                stn_j2534_status_t status = stn_j2534_start_keep_alive(interval_ms);
+                if (status != STN_J2534_STATUS_OK) {
+                    ESP_LOGE(TAG, "START_KEEP_ALIVE failed: status=%d", status);
+                    return J2534_ERR_FAILED;
+                }
+            }
+            break;
+
+        // TesterPresent Keep-Alive - Stop automatic transmission
+        case J2534_IOCTL_STOP_KEEP_ALIVE:
+            ESP_LOGI(TAG, "IOCTL: STOP_KEEP_ALIVE");
+            stn_j2534_stop_keep_alive();
+            break;
+#endif
+
         default:
             // Compatibility: Vendor IOCTLs (0x8000+) return success to avoid crashing apps
             // that probe for device-specific features. Standard IOCTLs still return error.

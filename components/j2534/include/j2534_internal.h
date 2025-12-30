@@ -196,6 +196,9 @@ j2534_channel_t* j2534_alloc_channel(void);
 uint32_t j2534_baudrate_to_can(uint32_t baudrate);
 void j2534_send_response(uint8_t cmd, j2534_error_t status, uint8_t *data, uint16_t data_len, QueueHandle_t *q);
 bool j2534_is_legacy_protocol(uint32_t protocol_id);
+bool j2534_is_j1850_protocol(uint32_t protocol_id);
+bool j2534_is_kline_protocol(uint32_t protocol_id);
+uint8_t j2534_get_legacy_header_size(uint32_t protocol_id, const uint8_t *data, uint32_t data_len);
 
 // TX indication (j2534_msg.c)
 void j2534_buffer_tx_indication(j2534_msg_t *orig_msg, uint32_t protocol_id);
