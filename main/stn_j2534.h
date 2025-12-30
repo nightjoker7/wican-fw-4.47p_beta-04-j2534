@@ -116,6 +116,14 @@ esp_err_t stn_j2534_init(void);
 esp_err_t stn_j2534_deinit(void);
 
 /**
+ * @brief Callback wrapper for stn_j2534_deinit (void return type)
+ * 
+ * This function is used as a callback for the j2534 component to call
+ * when it needs to deinitialize the STN bridge on connection failures.
+ */
+void stn_j2534_deinit_callback(void);
+
+/**
  * @brief Select protocol on STN chip
  * @param protocol Protocol to select (STN_PROTO_xxx)
  * @return Status code
@@ -225,6 +233,39 @@ stn_protocol_t stn_j2534_get_protocol(void);
  * @return Status code
  */
 stn_j2534_status_t stn_j2534_reset(void);
+
+/**
+ * @brief Read buffered messages from J1850 monitor mode
+ * @param msgs Buffer to receive messages
+ * @param max_msgs Maximum number of messages to read
+ * @param num_msgs Output: actual number of messages read
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_read_msgs(
+    stn_j2534_msg_t *msgs,
+    uint32_t max_msgs,
+    uint32_t *num_msgs
+);
+
+/**
+ * @brief Check if J1850 monitor mode is active
+ * @return true if monitor mode is running
+ */
+bool stn_j2534_is_monitor_active(void);
+
+/**
+ * @brief Send raw AT/ST command to STN chip
+ * @param cmd Command string (must end with \r)
+ * @param response Buffer for response
+ * @param response_size Size of response buffer
+ * @param timeout_ms Timeout in milliseconds
+ * @return Status code
+ * 
+ * @note This is a public wrapper for internal command sending.
+ *       Used by USDT module for direct chip control.
+ */
+stn_j2534_status_t stn_j2534_send_raw_cmd(const char* cmd, char* response, 
+                                           size_t response_size, int timeout_ms);
 
 #ifdef __cplusplus
 }

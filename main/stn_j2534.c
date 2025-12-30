@@ -60,9 +60,13 @@
 
 #define STN_J2534_UART_NUM          UART_NUM_1
 #define STN_J2534_BUFFER_SIZE       512
-#define STN_J2534_CMD_TIMEOUT_MS    1000
+#define STN_J2534_CMD_TIMEOUT_MS    200   // Reduced from 1000ms - J1850 responses are fast
 #define STN_J2534_MUTEX_TIMEOUT_MS  5000
 #define STN_J2534_READ_TIMEOUT_MS   10
+
+// Monitor mode settings
+#define STN_J2534_RX_BUFFER_SIZE    32      // Circular buffer for received messages
+#define STN_J2534_MONITOR_TASK_STACK 4096
 
 /* ============================================================================
  * External References (from elm327.c)
@@ -81,11 +85,33 @@ static stn_j2534_config_t s_config = {
     .baudrate = 0,
     .tx_header = {0x68, 0x6A, 0xF1},  // Default J1850/ISO header
     .tx_header_len = 3,
-    .timeout_ms = 1000,
+    .timeout_ms = 200,   // Reduced from 1000ms - J1850 is fast enough
     .headers_enabled = true,
     .echo_enabled = false,
     .adaptive_timing = true,
 };
+
+// Cache for J1850 header to avoid redundant ATSH commands
+static uint8_t s_last_j1850_header[3] = {0};
+
+/* ============================================================================
+ * Monitor Mode State (for continuous J1850 RX)
+ * ============================================================================ */
+
+// Circular buffer for received J1850 messages
+static stn_j2534_msg_t s_rx_buffer[STN_J2534_RX_BUFFER_SIZE];
+static volatile uint32_t s_rx_head = 0;
+static volatile uint32_t s_rx_tail = 0;
+static SemaphoreHandle_t s_rx_mutex = NULL;
+
+// Monitor mode control
+static volatile bool s_monitor_active = false;     // Is monitor mode running?
+static volatile bool s_monitor_pause = false;      // Pause request for TX
+static TaskHandle_t s_monitor_task = NULL;
+static SemaphoreHandle_t s_tx_done_sem = NULL;     // Signals TX complete
+
+// Forward declaration
+static void stn_j2534_reset_state(void);
 
 /* ============================================================================
  * Internal Helper Functions
@@ -239,6 +265,252 @@ static void stn_j2534_format_hex(const uint8_t* data, size_t len, char* out)
 }
 
 /* ============================================================================
+ * Monitor Mode Functions (Continuous J1850 RX)
+ * ============================================================================ */
+
+/**
+ * @brief Buffer a received J1850 message
+ */
+static void stn_j2534_buffer_rx_msg(const uint8_t* data, uint32_t len)
+{
+    if (len == 0 || len > sizeof(s_rx_buffer[0].data)) {
+        return;
+    }
+    
+    if (s_rx_mutex && xSemaphoreTake(s_rx_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        uint32_t next_head = (s_rx_head + 1) % STN_J2534_RX_BUFFER_SIZE;
+        
+        if (next_head != s_rx_tail) {  // Buffer not full
+            memcpy(s_rx_buffer[s_rx_head].data, data, len);
+            s_rx_buffer[s_rx_head].data_len = len;
+            s_rx_buffer[s_rx_head].timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+            s_rx_buffer[s_rx_head].rx_status = 0;
+            s_rx_head = next_head;
+            ESP_LOGI(TAG, "J1850 RX buffered: len=%lu head=%lu tail=%lu", len, s_rx_head, s_rx_tail);
+        } else {
+            ESP_LOGW(TAG, "J1850 RX buffer full, dropping message");
+        }
+        
+        xSemaphoreGive(s_rx_mutex);
+    }
+}
+
+/**
+ * @brief Parse a line from monitor mode output
+ * Format: hex bytes separated by spaces or continuous, terminated by \r
+ */
+static void stn_j2534_parse_monitor_line(const char* line)
+{
+    uint8_t msg_data[64];
+    int msg_len = 0;
+    const char* p = line;
+    
+    // Skip leading whitespace
+    while (*p && (*p == ' ' || *p == '\r' || *p == '\n')) {
+        p++;
+    }
+    
+    // Skip if this is a prompt or status message
+    if (*p == '>' || *p == 'S' || *p == 'O' || *p == 'N' || *p == 'B' || *p == '?') {
+        return;  // Skip prompts, SEARCHING..., OK, NO DATA, BUS ERROR, ?
+    }
+    
+    // Parse hex bytes
+    while (*p && msg_len < (int)sizeof(msg_data)) {
+        // Skip spaces
+        while (*p == ' ') p++;
+        
+        if (!*p || *p == '\r' || *p == '\n' || *p == '>') break;
+        
+        // Parse hex byte
+        if (isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1])) {
+            char hex[3] = {p[0], p[1], 0};
+            msg_data[msg_len++] = (uint8_t)strtol(hex, NULL, 16);
+            p += 2;
+        } else {
+            p++;  // Skip invalid character
+        }
+    }
+    
+    // Buffer if we got valid data
+    if (msg_len >= 3) {  // Minimum J1850 message is 3 bytes (header)
+        ESP_LOGI(TAG, "Monitor parsed: %d bytes", msg_len);
+        ESP_LOG_BUFFER_HEX(TAG, msg_data, msg_len);
+        stn_j2534_buffer_rx_msg(msg_data, msg_len);
+    }
+}
+
+/**
+ * @brief Monitor task - continuously receives J1850 messages
+ * Uses ATMA to put STN in monitor mode, parses output, buffers messages
+ */
+static void stn_j2534_monitor_task(void* arg)
+{
+    char rx_buffer[256];
+    int rx_pos = 0;
+    
+    ESP_LOGI(TAG, "Monitor task started");
+    
+    while (s_monitor_active) {
+        // Check for pause request (TX wants to send)
+        if (s_monitor_pause) {
+            ESP_LOGI(TAG, "Monitor pausing for TX...");
+            
+            // Send any character to exit ATMA mode
+            uart_write_bytes(STN_J2534_UART_NUM, "\r", 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            uart_flush_input(STN_J2534_UART_NUM);
+            
+            // Signal that we've paused
+            if (s_tx_done_sem) {
+                xSemaphoreGive(s_tx_done_sem);
+            }
+            
+            // Wait for TX to complete
+            while (s_monitor_pause && s_monitor_active) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            
+            if (!s_monitor_active) break;
+            
+            // Re-enter monitor mode
+            ESP_LOGI(TAG, "Monitor resuming...");
+            uart_flush_input(STN_J2534_UART_NUM);
+            uart_write_bytes(STN_J2534_UART_NUM, "ATMA\r", 5);
+            rx_pos = 0;
+            continue;
+        }
+        
+        // Read available data
+        int len = uart_read_bytes(STN_J2534_UART_NUM, rx_buffer + rx_pos, 
+                                  sizeof(rx_buffer) - rx_pos - 1, 
+                                  pdMS_TO_TICKS(50));
+        
+        if (len > 0) {
+            rx_pos += len;
+            rx_buffer[rx_pos] = '\0';
+            
+            // Process complete lines
+            char* line_start = rx_buffer;
+            char* line_end;
+            
+            while ((line_end = strchr(line_start, '\r')) != NULL) {
+                *line_end = '\0';
+                
+                if (strlen(line_start) > 0) {
+                    stn_j2534_parse_monitor_line(line_start);
+                }
+                
+                line_start = line_end + 1;
+                // Skip \n if present
+                if (*line_start == '\n') line_start++;
+            }
+            
+            // Move any partial line to beginning of buffer
+            if (line_start != rx_buffer && *line_start) {
+                int remaining = rx_pos - (line_start - rx_buffer);
+                memmove(rx_buffer, line_start, remaining);
+                rx_pos = remaining;
+            } else if (line_start == rx_buffer + rx_pos) {
+                rx_pos = 0;  // All data processed
+            }
+            
+            // Prevent buffer overflow
+            if (rx_pos > (int)sizeof(rx_buffer) - 64) {
+                ESP_LOGW(TAG, "Monitor buffer overflow, resetting");
+                rx_pos = 0;
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5));  // Small delay to prevent CPU hogging
+    }
+    
+    ESP_LOGI(TAG, "Monitor task exiting");
+    s_monitor_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Start J1850 monitor mode
+ */
+static esp_err_t stn_j2534_start_monitor(void)
+{
+    if (s_monitor_active) {
+        ESP_LOGI(TAG, "Monitor already active");
+        return ESP_OK;
+    }
+    
+    // Initialize synchronization primitives
+    if (!s_rx_mutex) {
+        s_rx_mutex = xSemaphoreCreateMutex();
+    }
+    if (!s_tx_done_sem) {
+        s_tx_done_sem = xSemaphoreCreateBinary();
+    }
+    
+    // Clear RX buffer
+    s_rx_head = 0;
+    s_rx_tail = 0;
+    
+    // Take UART semaphore - monitor task will own it
+    if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(STN_J2534_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to take UART semaphore for monitor mode");
+        return ESP_FAIL;
+    }
+    
+    // Start monitor mode on STN
+    uart_flush_input(STN_J2534_UART_NUM);
+    uart_write_bytes(STN_J2534_UART_NUM, "ATMA\r", 5);
+    
+    s_monitor_active = true;
+    s_monitor_pause = false;
+    
+    // Create monitor task
+    BaseType_t ret = xTaskCreate(stn_j2534_monitor_task, "stn_monitor", 
+                                  STN_J2534_MONITOR_TASK_STACK, NULL, 10, &s_monitor_task);
+    
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create monitor task");
+        s_monitor_active = false;
+        xSemaphoreGive(xuart1_semaphore);
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "J1850 monitor mode started");
+    return ESP_OK;
+}
+
+/**
+ * @brief Stop J1850 monitor mode
+ */
+static void stn_j2534_stop_monitor(void)
+{
+    if (!s_monitor_active) {
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Stopping J1850 monitor mode...");
+    
+    s_monitor_active = false;
+    
+    // Wait for task to exit
+    int timeout = 50;  // 500ms
+    while (s_monitor_task != NULL && timeout-- > 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // Send character to exit ATMA
+    uart_write_bytes(STN_J2534_UART_NUM, "\r", 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uart_flush_input(STN_J2534_UART_NUM);
+    
+    // Release UART semaphore
+    xSemaphoreGive(xuart1_semaphore);
+    
+    ESP_LOGI(TAG, "J1850 monitor mode stopped");
+}
+
+/* ============================================================================
  * Public Functions
  * ============================================================================ */
 
@@ -249,6 +521,9 @@ esp_err_t stn_j2534_init(void)
     }
     
     ESP_LOGI(TAG, "Initializing STN chip for J2534...");
+    
+    // Reset internal state first
+    stn_j2534_reset_state();
     
     // Check if UART semaphore is available (must be initialized by elm327_init)
     if (!xuart1_semaphore) {
@@ -279,21 +554,23 @@ esp_err_t stn_j2534_init(void)
         gpio_set_level(OBD_RESET_PIN, 1);
         vTaskDelay(pdMS_TO_TICKS(500));  // Give chip time to boot after reset
         
-        // Wait for chip to come up (up to 5 seconds)
+        // Wait for chip to come up (up to 3 seconds - reduced from 5)
         int retry_count = 0;
-        const int max_retries = 50;  // 50 x 100ms = 5 seconds
+        const int max_retries = 30;  // 30 x 100ms = 3 seconds
         
         while (elm327_chip_get_status() != ELM327_READY && retry_count < max_retries) {
             vTaskDelay(pdMS_TO_TICKS(100));
             retry_count++;
-            if (retry_count % 10 == 0) {
+            if (retry_count % 5 == 0) {
                 ESP_LOGI(TAG, "Waiting for STN chip... (%d/%d) GPIO7=%d", 
                          retry_count, max_retries, gpio_get_level(OBD_READY_PIN));
             }
         }
         
         if (elm327_chip_get_status() != ELM327_READY) {
-            ESP_LOGE(TAG, "STN chip not ready after reset, GPIO7=%d", gpio_get_level(OBD_READY_PIN));
+            ESP_LOGE(TAG, "STN chip not ready after reset! GPIO7=%d (expected HIGH)", gpio_get_level(OBD_READY_PIN));
+            ESP_LOGE(TAG, "Check: 1) Is OBD chip powered? 2) Is OBD_SLEEP_PIN (GPIO9) HIGH?");
+            ESP_LOGI(TAG, "OBD_SLEEP_PIN (GPIO9) level = %d", gpio_get_level(OBD_SLEEP_PIN));
             elm327_set_stn_j2534_active(false);  // Re-enable elm327_read_task on failure
             return ESP_ERR_INVALID_STATE;
         }
@@ -318,6 +595,53 @@ esp_err_t stn_j2534_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief Configure STN power pin switch (required for legacy protocols)
+ * @note This configures internal hardware power switches - VTPPSW10 enables J1850/ISO buses
+ */
+static void stn_j2534_configure_power_pins(void)
+{
+    char response[128];
+    
+    ESP_LOGI(TAG, "Configuring STN power pins (VTPPSW)...");
+    
+    // Check firmware version - VTPPSW is only on certain firmware versions
+    stn_j2534_status_t status = stn_j2534_send_cmd("VTVERS\r", response, sizeof(response), 1000);
+    if (status != STN_J2534_STATUS_OK) {
+        ESP_LOGW(TAG, "VTVERS failed - may not be VT firmware");
+        return;
+    }
+    
+    // Check if V2.3.22 or later (required for VTPPSW)
+    if (strstr(response, "V2.3") == NULL) {
+        ESP_LOGW(TAG, "Firmware not V2.3.x, skipping VTPPSW: %s", response);
+        return;
+    }
+    ESP_LOGI(TAG, "Firmware version: %s", response);
+    
+    // Read current power switch state
+    status = stn_j2534_send_cmd("VTPPSWS\r", response, sizeof(response), 500);
+    if (status != STN_J2534_STATUS_OK) {
+        ESP_LOGW(TAG, "VTPPSWS not supported");
+        return;
+    }
+    
+    if (strstr(response, "10") != NULL) {
+        ESP_LOGI(TAG, "PPSW already set to 10 (J1850/ISO enabled)");
+    } else {
+        ESP_LOGI(TAG, "Setting PPSW to 10 for J1850/ISO support...");
+        status = stn_j2534_send_cmd("VTPPSW10\r", response, sizeof(response), 500);
+        if (status == STN_J2534_STATUS_OK && strstr(response, "OK") != NULL) {
+            ESP_LOGI(TAG, "PPSW set to 10 successfully");
+            // Need to reset chip after PPSW change
+            ESP_LOGI(TAG, "Resetting chip after PPSW change...");
+            stn_j2534_send_cmd("ATZ\r", response, sizeof(response), 2000);
+        } else {
+            ESP_LOGW(TAG, "Failed to set PPSW to 10: %s", response);
+        }
+    }
+}
+
 stn_j2534_status_t stn_j2534_reset(void)
 {
     char response[128];
@@ -328,6 +652,10 @@ stn_j2534_status_t stn_j2534_reset(void)
     if (status != STN_J2534_STATUS_OK) {
         ESP_LOGW(TAG, "ATZ failed, trying ATD");
     }
+    
+    // CRITICAL: Configure power pins for J1850/ISO protocols
+    // This enables the internal hardware switches needed for legacy protocols
+    stn_j2534_configure_power_pins();
     
     // Send ATD (defaults)
     status = stn_j2534_send_cmd("ATD\r", response, sizeof(response), 500);
@@ -408,55 +736,98 @@ stn_j2534_status_t stn_j2534_select_protocol(stn_protocol_t protocol)
         ESP_LOGI(TAG, "Initializing J1850 VPW (Class 2 Serial) protocol");
         
         // Reset to defaults first
-        stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        status = stn_j2534_send_cmd("ATD\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATD response: [%s] status=%d", response, status);
         
         // Select protocol 2 (J1850 VPW 10.4 kbaud)
         status = stn_j2534_send_cmd("ATSP2\r", response, sizeof(response), 
                                      STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATSP2 response: [%s] status=%d", response, status);
         if (status != STN_J2534_STATUS_OK) {
             ESP_LOGE(TAG, "ATSP2 failed: %s", response);
             return STN_J2534_STATUS_PROTOCOL_ERROR;
         }
         
-        // Enable headers - J2534 needs full message with header bytes
-        stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        // Enable headers - J2534 needs full message with header bytes in responses
+        status = stn_j2534_send_cmd("ATH1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATH1 response: [%s] status=%d", response, status);
         
         // Disable spaces for cleaner parsing
-        stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        status = stn_j2534_send_cmd("ATS0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATS0 response: [%s] status=%d", response, status);
         
         // Disable echo
-        stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        status = stn_j2534_send_cmd("ATE0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATE0 response: [%s] status=%d", response, status);
         
         // Allow long messages (up to 256 bytes)
-        stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        status = stn_j2534_send_cmd("ATAL\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATAL response: [%s] status=%d", response, status);
         
-        // Set default timeout (ATST in 4ms units, 0xFF = 1020ms)
-        stn_j2534_send_cmd("ATST FF\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
-        
-        // Try STN-specific command for millisecond timeout
-        stn_j2534_send_cmd("STPTO 1000\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        // Set protocol timeout via STPTO (milliseconds) - 100ms is plenty for J1850 VPW
+        // J1850 at 10.4 kbaud: 12-byte message takes ~10ms, so 100ms gives room for bus arbitration
+        status = stn_j2534_send_cmd("STPTO 100\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        if (status != STN_J2534_STATUS_OK || strstr(response, "?")) {
+            // Fall back to ATST (4ms units): 25 * 4 = 100ms
+            ESP_LOGI(TAG, "STPTO not supported, using ATST");
+            status = stn_j2534_send_cmd("ATST 19\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        }
+        ESP_LOGI(TAG, "Protocol timeout response: [%s] status=%d", response, status);
         
         // Disable adaptive timing - use fixed timing for J2534 compliance
-        stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        status = stn_j2534_send_cmd("ATAT0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATAT0 response: [%s] status=%d", response, status);
         
-        // Set default J1850 header (functional broadcast to BCM)
-        stn_j2534_send_cmd("ATSH686AF1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        // CRITICAL: Configure receive filters for J2534
+        // Default J1850 filter is 006B00,14FF00 which only accepts messages TO 0x6B
+        // For J2534 we need to receive responses to the tester address (F0)
         
-        // Try to wake up the bus by sending a test message (TesterPresent)
-        // This helps ensure the bus is actually active
-        ESP_LOGI(TAG, "Attempting bus initialization...");
-        status = stn_j2534_send_cmd("3F00\r", response, sizeof(response), 5000);
-        if (status == STN_J2534_STATUS_NO_DATA) {
-            // No response is OK for TesterPresent - bus may be active
-            ESP_LOGI(TAG, "No response to bus init (expected for some ECUs)");
-        } else if (status != STN_J2534_STATUS_OK) {
-            ESP_LOGW(TAG, "Bus init response: %s", response);
-        } else {
-            ESP_LOGI(TAG, "Bus init got response: %s", response);
-        }
+        // Disable IFR (In-Frame Response) display to avoid single-byte ack messages
+        status = stn_j2534_send_cmd("AT IFR0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "AT IFR0 response: [%s] status=%d", response, status);
+        
+        // Set receive address to F0 (standard diagnostic tester address)
+        // This tells the STN chip to accept messages where target = F0
+        status = stn_j2534_send_cmd("ATSR F0\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATSR F0 response: [%s] status=%d", response, status);
+        
+        // Enable auto-receive mode - receive all messages without filtering
+        status = stn_j2534_send_cmd("ATAR\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "ATAR response: [%s] status=%d", response, status);
+        
+        // Clear any existing programmable filters
+        status = stn_j2534_send_cmd("STFCP\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "STFCP response: [%s] status=%d", response, status);
+        
+        // Add pass filter for messages to F0: pattern=00F000, mask=00FF00 
+        // This matches any message where byte 1 (target address) = F0
+        status = stn_j2534_send_cmd("STFAP 00F000,00FF00\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "STFAP 00F000,00FF00 response: [%s] status=%d", response, status);
+        
+        // Also add filter for broadcast/functional responses (target FE)
+        status = stn_j2534_send_cmd("STFAP 00FE00,00FF00\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "STFAP 00FE00,00FF00 response: [%s] status=%d", response, status);
+        
+        // Also accept messages from ECU directly addressed (some ECUs use 6C instead of FE)
+        status = stn_j2534_send_cmd("STFAP 006C00,00FF00\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "STFAP 006C00,00FF00 response: [%s] status=%d", response, status);
+        
+        ESP_LOGI(TAG, "J1850 VPW filters configured for tester address F0");
+        
+        // Send a test message to verify bus connectivity
+        // Use a simple OBD broadcast (3E = TesterPresent)
+        status = stn_j2534_send_cmd("ATSH 68 6A F1\r", response, sizeof(response), STN_J2534_CMD_TIMEOUT_MS);
+        ESP_LOGI(TAG, "Test header response: [%s] status=%d", response, status);
+        
+        status = stn_j2534_send_cmd("3F\r", response, sizeof(response), 2000);  // Request all PIDs
+        ESP_LOGI(TAG, "Test msg (3F) response: [%s] status=%d", response, status);
         
         s_config.protocol = protocol;
         ESP_LOGI(TAG, "J1850 VPW protocol initialized successfully");
+        
+        // NOTE: Monitor mode disabled for now - focus on basic request/response first
+        // The STN chip is left at the prompt ready to receive commands
+        
         return STN_J2534_STATUS_OK;
     }
     
@@ -728,39 +1099,110 @@ stn_j2534_status_t stn_j2534_send_message(
 {
     char cmd[STN_J2534_BUFFER_SIZE];
     char response[STN_J2534_BUFFER_SIZE];
-    stn_j2534_status_t status;
+    stn_j2534_status_t status = STN_J2534_STATUS_OK;
     
     *num_responses = 0;
     
-    if (data_len > 7) {
-        // For messages > 7 bytes, would need multi-frame handling
-        // Not implemented yet - legacy protocols typically use shorter messages
-        ESP_LOGW(TAG, "Message too long for legacy protocol: %lu bytes", data_len);
+    if (data_len < 1) {
+        ESP_LOGW(TAG, "Empty message");
         return STN_J2534_STATUS_CHIP_ERROR;
     }
     
-    // Set timeout using STPTO if available (millisecond precision)
-    // Fall back to ATST if STPTO fails
-    char timeout_cmd[32];
-    snprintf(timeout_cmd, sizeof(timeout_cmd), "STPTO%lu\r", timeout_ms);
-    status = stn_j2534_send_cmd(timeout_cmd, response, sizeof(response), 500);
-    if (status != STN_J2534_STATUS_OK) {
-        // Fall back to ATST (4ms units)
-        uint32_t timeout_hex = (timeout_ms / 4);
-        if (timeout_hex > 0xFF) timeout_hex = 0xFF;
-        snprintf(timeout_cmd, sizeof(timeout_cmd), "ATST%02lX\r", timeout_hex);
-        stn_j2534_send_cmd(timeout_cmd, response, sizeof(response), 500);
+    // If monitor mode is active, we need to pause it for TX
+    bool was_monitoring = s_monitor_active;
+    if (was_monitoring) {
+        ESP_LOGI(TAG, "Pausing monitor for TX...");
+        s_monitor_pause = true;
+        
+        // Wait for monitor task to pause and release UART
+        if (s_tx_done_sem) {
+            if (xSemaphoreTake(s_tx_done_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGE(TAG, "Timeout waiting for monitor to pause");
+                s_monitor_pause = false;
+                return STN_J2534_STATUS_CHIP_ERROR;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // Additional settling time
     }
     
-    // Build hex data command
-    stn_j2534_format_hex(data, data_len, cmd);
-    strcat(cmd, "\r");
+    // Now safe to use UART directly (monitor is paused or not active)
+    if (!was_monitoring) {
+        // Need to take semaphore if not monitoring
+        if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(STN_J2534_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to take UART semaphore");
+            return STN_J2534_STATUS_CHIP_ERROR;
+        }
+    }
+    
+    // Flush any stale data
+    uart_flush_input(STN_J2534_UART_NUM);
+    
+    // For J1850 VPW/PWM protocols, the J2534 message includes header bytes
+    const uint8_t *payload_data = data;
+    uint32_t payload_len = data_len;
+    
+    if (s_config.protocol == STN_PROTO_J1850VPW || 
+        s_config.protocol == STN_PROTO_J1850PWM) {
+        
+        if (data_len >= 3) {
+            // Extract 3-byte J1850 header and set via ATSH
+            char header_cmd[32];
+            snprintf(header_cmd, sizeof(header_cmd), "ATSH %02X %02X %02X\r", 
+                     data[0], data[1], data[2]);
+            
+            // Only update header if different from last one
+            if (data[0] != s_last_j1850_header[0] || data[1] != s_last_j1850_header[1] || 
+                data[2] != s_last_j1850_header[2]) {
+                
+                ESP_LOGI(TAG, "Setting J1850 header: %s", header_cmd);
+                uart_write_bytes(STN_J2534_UART_NUM, header_cmd, strlen(header_cmd));
+                int len = stn_j2534_read_until(response, sizeof(response), ">", 500);
+                ESP_LOGI(TAG, "ATSH response (%d): [%s]", len, response);
+                
+                s_last_j1850_header[0] = data[0];
+                s_last_j1850_header[1] = data[1];
+                s_last_j1850_header[2] = data[2];
+            }
+            
+            // Payload is everything after the 3-byte header
+            payload_data = &data[3];
+            payload_len = data_len - 3;
+            
+            ESP_LOGI(TAG, "J1850 TX: hdr=%02X%02X%02X data_len=%lu", 
+                     data[0], data[1], data[2], payload_len);
+        }
+    }
+    
+    // Build hex data command (payload only, header is set via ATSH)
+    if (payload_len > 0) {
+        stn_j2534_format_hex(payload_data, payload_len, cmd);
+        strcat(cmd, "\r");
+    } else {
+        strcpy(cmd, "\r");
+    }
     
     // Send and wait for responses
-    status = stn_j2534_send_cmd(cmd, response, sizeof(response), timeout_ms + 500);
+    ESP_LOGI(TAG, "J1850 TX cmd: [%s]", cmd);
+    uart_flush_input(STN_J2534_UART_NUM);
+    uart_write_bytes(STN_J2534_UART_NUM, cmd, strlen(cmd));
     
-    if (status == STN_J2534_STATUS_OK || status == STN_J2534_STATUS_NO_DATA) {
-        // Parse responses (multiple lines possible)
+    // Read response with appropriate timeout (add small buffer for UART transfer)
+    int rsp_len = stn_j2534_read_until(response, sizeof(response), ">", timeout_ms + 50);
+    response[rsp_len] = '\0';
+    
+    ESP_LOGI(TAG, "STN raw response (len=%d): [%s]", rsp_len, response);
+    
+    // Check for errors
+    if (strstr(response, "NO DATA")) {
+        status = STN_J2534_STATUS_NO_DATA;
+    } else if (strstr(response, "BUS ERROR") || strstr(response, "ERROR")) {
+        status = STN_J2534_STATUS_BUS_ERROR;
+    } else if (rsp_len == 0) {
+        status = STN_J2534_STATUS_TIMEOUT;
+    }
+    
+    // Parse responses if we got data
+    if (rsp_len > 0 && !strstr(response, "NO DATA") && !strstr(response, "ERROR")) {
         char* line_start = response;
         char* line_end;
         uint32_t resp_count = 0;
@@ -768,18 +1210,25 @@ stn_j2534_status_t stn_j2534_send_message(
         while ((line_end = strchr(line_start, '\r')) != NULL && resp_count < max_responses) {
             *line_end = '\0';
             
-            // Skip empty lines and prompt
-            if (strlen(line_start) >= 2 && line_start[0] != '>') {
-                // Parse this response line
+            // Skip empty lines, prompts, and status messages
+            // Require at least 6 chars = 3 hex bytes for valid J1850 message
+            if (strlen(line_start) >= 6 && line_start[0] != '>' && 
+                line_start[0] != 'O' && line_start[0] != 'S') {  // Skip OK, SEARCHING...
+                
                 int parsed_len = stn_j2534_parse_hex_response(
                     line_start, 
                     responses[resp_count].data, 
                     sizeof(responses[resp_count].data));
                 
-                if (parsed_len > 0) {
+                if (parsed_len >= 3) {  // Minimum valid J1850 message (3-byte header)
                     responses[resp_count].data_len = parsed_len;
                     responses[resp_count].timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
                     responses[resp_count].rx_status = 0;
+                    ESP_LOGI(TAG, "Parsed RX[%lu]: %d bytes data=%02X%02X%02X...", 
+                             resp_count, parsed_len,
+                             responses[resp_count].data[0],
+                             responses[resp_count].data[1],
+                             responses[resp_count].data[2]);
                     resp_count++;
                 }
             }
@@ -788,10 +1237,15 @@ stn_j2534_status_t stn_j2534_send_message(
         }
         
         *num_responses = resp_count;
-        
-        if (resp_count == 0 && status == STN_J2534_STATUS_OK) {
-            return STN_J2534_STATUS_NO_DATA;
-        }
+        ESP_LOGI(TAG, "Total responses parsed: %lu", resp_count);
+    }
+    
+    // Resume monitor mode if it was active
+    if (was_monitoring) {
+        ESP_LOGI(TAG, "Resuming monitor mode...");
+        s_monitor_pause = false;  // Signal monitor task to resume
+    } else {
+        xSemaphoreGive(xuart1_semaphore);
     }
     
     return status;
@@ -829,6 +1283,24 @@ stn_protocol_t stn_j2534_get_protocol(void)
     return s_config.protocol;
 }
 
+/**
+ * @brief Reset internal state variables without touching the chip
+ */
+static void stn_j2534_reset_state(void)
+{
+    // Clear header cache
+    memset(s_last_j1850_header, 0, sizeof(s_last_j1850_header));
+    
+    // Reset config to defaults
+    s_config.protocol = STN_PROTO_AUTO;
+    s_config.baudrate = 0;
+    s_config.tx_header[0] = 0x68;
+    s_config.tx_header[1] = 0x6A;
+    s_config.tx_header[2] = 0xF1;
+    s_config.tx_header_len = 3;
+    s_config.timeout_ms = 200;  // Fast timeout for J1850
+}
+
 esp_err_t stn_j2534_deinit(void)
 {
     if (!s_initialized) {
@@ -837,17 +1309,98 @@ esp_err_t stn_j2534_deinit(void)
     
     ESP_LOGI(TAG, "Deinitializing STN-J2534 bridge...");
     
-    // Reset the STN chip to defaults
-    stn_j2534_reset();
-    
+    // Mark as not initialized first to stop any new operations
     s_initialized = false;
+    
+    // Stop monitor task if running
+    stn_j2534_stop_monitor();
+    
+    // CRITICAL: Do a HARDWARE reset of the STN chip
+    // Software reset (ATZ) may not work if chip is stuck
+    ESP_LOGI(TAG, "Performing hardware reset of STN chip...");
+    gpio_set_level(OBD_RESET_PIN, 0);  // Pull reset low
+    vTaskDelay(pdMS_TO_TICKS(100));    // Longer low pulse for clean reset
+    gpio_set_level(OBD_RESET_PIN, 1);  // Release reset
+    vTaskDelay(pdMS_TO_TICKS(500));    // Wait for chip to FULLY boot (was 200ms - too short!)
+    
+    // Flush any garbage from UART (chip sends bootup message)
+    uart_flush_input(STN_J2534_UART_NUM);
+    if (uart1_queue) {
+        xQueueReset(uart1_queue);
+    }
+    
+    // Wait for chip ready signal
+    int retry = 0;
+    while (elm327_chip_get_status() != ELM327_READY && retry < 10) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        retry++;
+    }
     
     // Re-enable elm327_read_task
     elm327_set_stn_j2534_active(false);
     
-    ESP_LOGI(TAG, "STN-J2534 bridge deinitialized");
+    // Reset internal state
+    stn_j2534_reset_state();
+    
+    ESP_LOGI(TAG, "STN-J2534 bridge deinitialized (chip ready: %s)", 
+             elm327_chip_get_status() == ELM327_READY ? "YES" : "NO");
     
     return ESP_OK;
+}
+
+// Callback wrapper for j2534 component (void return type)
+void stn_j2534_deinit_callback(void)
+{
+    stn_j2534_deinit();
+}
+
+stn_j2534_status_t stn_j2534_read_msgs(
+    stn_j2534_msg_t *msgs,
+    uint32_t max_msgs,
+    uint32_t *num_msgs)
+{
+    *num_msgs = 0;
+    
+    if (!s_rx_mutex) {
+        return STN_J2534_STATUS_CHIP_ERROR;
+    }
+    
+    if (xSemaphoreTake(s_rx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return STN_J2534_STATUS_TIMEOUT;
+    }
+    
+    uint32_t count = 0;
+    while (count < max_msgs && s_rx_tail != s_rx_head) {
+        memcpy(&msgs[count], &s_rx_buffer[s_rx_tail], sizeof(stn_j2534_msg_t));
+        s_rx_tail = (s_rx_tail + 1) % STN_J2534_RX_BUFFER_SIZE;
+        count++;
+    }
+    
+    xSemaphoreGive(s_rx_mutex);
+    
+    *num_msgs = count;
+    
+    if (count > 0) {
+        ESP_LOGI(TAG, "stn_j2534_read_msgs: returned %lu messages", count);
+        return STN_J2534_STATUS_OK;
+    }
+    
+    return STN_J2534_STATUS_NO_DATA;
+}
+
+bool stn_j2534_is_monitor_active(void)
+{
+    return s_monitor_active;
+}
+
+/**
+ * @brief Public wrapper for sending raw AT/ST commands
+ * Used by USDT module for direct chip control.
+ */
+stn_j2534_status_t stn_j2534_send_raw_cmd(const char* cmd, char* response, 
+                                           size_t response_size, int timeout_ms)
+{
+    return stn_j2534_send_cmd(cmd, response, response_size, timeout_ms);
 }
 
 #else  // HARDWARE_VER != WICAN_PRO
@@ -941,6 +1494,36 @@ stn_protocol_t stn_j2534_get_protocol(void)
 esp_err_t stn_j2534_deinit(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+// Stub callback wrapper for non-Pro hardware
+void stn_j2534_deinit_callback(void)
+{
+    // No-op for non-Pro hardware
+}
+
+stn_j2534_status_t stn_j2534_read_msgs(
+    stn_j2534_msg_t *msgs,
+    uint32_t max_msgs,
+    uint32_t *num_msgs)
+{
+    *num_msgs = 0;
+    return STN_J2534_STATUS_CHIP_ERROR;
+}
+
+bool stn_j2534_is_monitor_active(void)
+{
+    return false;
+}
+
+stn_j2534_status_t stn_j2534_send_raw_cmd(const char* cmd, char* response, 
+                                           size_t response_size, int timeout_ms)
+{
+    (void)cmd;
+    (void)response;
+    (void)response_size;
+    (void)timeout_ms;
+    return STN_J2534_STATUS_CHIP_ERROR;
 }
 
 #endif  // HARDWARE_VER == WICAN_PRO

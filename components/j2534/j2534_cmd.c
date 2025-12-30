@@ -1,3 +1,22 @@
+/*
+ * This file is part of the WiCAN project.
+ *
+ * Copyright (C) 2025 Matt Deering
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file j2534_cmd.c
  * @brief J2534 command processing and protocol parser
@@ -143,6 +162,7 @@ void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_
                                (data[10] << 8) | data[11];
 
             j2534_msg_t msgs[2];
+            memset(msgs, 0, sizeof(msgs));  // Clear to catch uninitialized data
             uint32_t num_msgs = (max_msgs > 2) ? 2 : max_msgs;
 
             status = j2534_read_msgs(ch_id, msgs, &num_msgs, timeout);
@@ -156,6 +176,10 @@ void j2534_handle_command(uint8_t cmd, uint8_t *data, uint16_t len, QueueHandle_
             resp_len = 4;
 
             for (uint32_t i = 0; i < num_msgs; i++) {
+                ESP_LOGI(TAG, "CMD_READ_MSGS[%lu]: proto=0x%lX rx_status=0x%lX data_size=%lu data=%02X%02X%02X%02X",
+                         i, msgs[i].protocol_id, msgs[i].rx_status, msgs[i].data_size,
+                         msgs[i].data[0], msgs[i].data[1], msgs[i].data[2], msgs[i].data[3]);
+                
                 uint32_t msg_overhead = 20;
                 if (resp_len + msg_overhead + msgs[i].data_size > max_resp) {
                     ESP_LOGW(TAG, "READ_MSGS: Response too large, truncating at msg %lu", i);

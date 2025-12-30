@@ -1,3 +1,22 @@
+/*
+ * This file is part of the WiCAN project.
+ *
+ * Copyright (C) 2025 Matt Deering
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file wican_comm.c
  * @brief WiCAN TCP and USB Serial Communication Implementation
@@ -845,10 +864,38 @@ bool wican_can_connect(wican_context_t *ctx, uint32_t protocol, uint32_t flags,
     uint16_t resp_len = sizeof(resp_data);
     uint8_t resp_cmd, resp_status;
     
+    /* Determine timeout based on protocol type:
+     * - CAN/ISO15765: 2 seconds (fast, direct ESP32 TWAI)
+     * - J1850/ISO9141/ISO14230: 10 seconds (slow, STN chip init + bus wake)
+     * Legacy protocols require longer timeout because:
+     *   1. STN chip must be woken up (GPIO signals)
+     *   2. ATZ reset + ATD defaults + configuration commands
+     *   3. ATSP protocol selection
+     *   4. Bus initialization (tester present message)
+     */
+    uint32_t connect_timeout_ms = 2000;  /* Default for CAN protocols */
+    
+    /* Check for legacy protocols (J1850, ISO9141, ISO14230) */
+    switch (protocol) {
+        case 0x01:  /* J1850VPW */
+        case 0x02:  /* J1850PWM */
+        case 0x03:  /* ISO9141 */
+        case 0x04:  /* ISO14230 */
+        case 0x8000: /* J1850VPW_PS */
+        case 0x8001: /* J1850PWM_PS */
+        case 0x8002: /* ISO9141_PS */
+        case 0x8003: /* ISO14230_PS */
+            connect_timeout_ms = 10000;  /* 10 seconds for legacy protocols */
+            OutputDebugStringA("[WICAN] can_connect: legacy protocol detected, using 10 second timeout\n");
+            break;
+        default:
+            break;
+    }
+    
     {
         char dbg[256];
-        sprintf(dbg, "[WICAN] can_connect: device_id=%lu protocol=%lu flags=%lu baud=%lu\n",
-                ctx->device_id, protocol, flags, baudrate);
+        sprintf(dbg, "[WICAN] can_connect: device_id=%lu protocol=%lu flags=%lu baud=%lu timeout=%lu\n",
+                ctx->device_id, protocol, flags, baudrate, connect_timeout_ms);
         OutputDebugStringA(dbg);
         printf("%s", dbg);
     }
@@ -887,10 +934,14 @@ bool wican_can_connect(wican_context_t *ctx, uint32_t protocol, uint32_t flags,
         return false;
     }
     
-    OutputDebugStringA("[WICAN] can_connect: waiting for response...\n");
+    {
+        char dbg[128];
+        sprintf(dbg, "[WICAN] can_connect: waiting for response (timeout=%lums)...\n", connect_timeout_ms);
+        OutputDebugStringA(dbg);
+    }
     
-    if (!wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, 2000)) {
-        OutputDebugStringA("[WICAN] can_connect: receive_response FAILED\n");
+    if (!wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, connect_timeout_ms)) {
+        OutputDebugStringA("[WICAN] can_connect: receive_response FAILED (timeout or error)\n");
         return false;
     }
     
@@ -1004,6 +1055,24 @@ bool wican_read_messages(wican_context_t *ctx, uint32_t channel_id, wican_can_ms
         return true;
     }
     
+    /* Debug: hex dump first 64 bytes of response to file */
+    {
+        char dbg[512];
+        int dbg_len = sprintf(dbg, "ReadMsgs response (len=%u): ", resp_len);
+        for (int k = 0; k < resp_len && k < 64; k++) {
+            dbg_len += sprintf(dbg + dbg_len, "%02X ", resp_data[k]);
+        }
+        strcat(dbg, "\n");
+        OutputDebugStringA(dbg);
+        
+        /* Also write to debug file on Desktop */
+        FILE *df = fopen("C:\\Users\\night\\OneDrive\\Desktop\\wican_wire_debug.txt", "a");
+        if (df) {
+            fprintf(df, "%s", dbg);
+            fclose(df);
+        }
+    }
+    
     uint32_t msg_count = ((uint32_t)resp_data[0] << 24) |
                          ((uint32_t)resp_data[1] << 16) |
                          ((uint32_t)resp_data[2] << 8) |
@@ -1016,8 +1085,18 @@ bool wican_read_messages(wican_context_t *ctx, uint32_t channel_id, wican_can_ms
     for (uint32_t i = 0; i < msg_count && offset < resp_len; i++) {
         if (offset + 20 > resp_len) break;
         
-        /* Skip protocol_id (4 bytes) */
+        /* Protocol ID (4 bytes) - needed to detect legacy protocols */
+        uint32_t protocol_id = ((uint32_t)resp_data[offset] << 24) |
+                               ((uint32_t)resp_data[offset + 1] << 16) |
+                               ((uint32_t)resp_data[offset + 2] << 8) |
+                               resp_data[offset + 3];
         offset += 4;
+        
+        /* Check if this is a legacy protocol (J1850, ISO9141, ISO14230) */
+        bool is_legacy_proto = (protocol_id == 0x01 || protocol_id == 0x02 ||
+                                protocol_id == 0x03 || protocol_id == 0x04 ||
+                                protocol_id == 0x8000 || protocol_id == 0x8001 ||
+                                protocol_id == 0x8002 || protocol_id == 0x8003);
         
         /* RX status (4 bytes) */
         uint32_t rx_status = ((uint32_t)resp_data[offset] << 24) |
@@ -1038,6 +1117,17 @@ bool wican_read_messages(wican_context_t *ctx, uint32_t channel_id, wican_can_ms
                              ((uint32_t)resp_data[offset + 1] << 16) |
                              ((uint32_t)resp_data[offset + 2] << 8) |
                              resp_data[offset + 3];
+        
+        {
+            char dbg[256];
+            sprintf(dbg, "MSG[%lu] raw: offset=%u proto=0x%lX rx_status=0x%lX data_size_bytes=%02X%02X%02X%02X (parsed=%lu)\n", 
+                    i, offset, protocol_id, rx_status,
+                    resp_data[offset], resp_data[offset+1], resp_data[offset+2], resp_data[offset+3], data_size);
+            OutputDebugStringA(dbg);
+            FILE *df = fopen("C:\\Users\\night\\OneDrive\\Desktop\\wican_wire_debug.txt", "a");
+            if (df) { fprintf(df, "%s", dbg); fclose(df); }
+        }
+        
         offset += 4;
         
         /* Skip extra (4 bytes) */
@@ -1045,29 +1135,48 @@ bool wican_read_messages(wican_context_t *ctx, uint32_t channel_id, wican_can_ms
         
         if (offset + data_size > resp_len) break;
         
-        /* First 4 bytes of data are CAN ID */
-        if (data_size >= 4) {
-            msgs[i].can_id = ((uint32_t)resp_data[offset] << 24) |
-                             ((uint32_t)resp_data[offset + 1] << 16) |
-                             ((uint32_t)resp_data[offset + 2] << 8) |
-                             resp_data[offset + 3];
-            offset += 4;
-            data_size -= 4;
+        if (is_legacy_proto) {
+            /* Legacy protocols: Data is raw message bytes (no CAN ID prefix) */
+            msgs[i].can_id = 0;  /* Not used for legacy */
+            msgs[i].data_len = (data_size > sizeof(msgs[i].data)) ? sizeof(msgs[i].data) : data_size;
+            memcpy(msgs[i].data, &resp_data[offset], msgs[i].data_len);
+            offset += data_size;
+            msgs[i].flags = 0x80;  /* Flag legacy protocol */
+            
+            {
+                char dbg[256];
+                sprintf(dbg, "[WICAN] read_messages: LEGACY data_len=%u offset=%u data=%02X%02X%02X%02X%02X%02X\n", 
+                        msgs[i].data_len, offset - data_size,
+                        resp_data[offset - data_size], resp_data[offset - data_size + 1], 
+                        resp_data[offset - data_size + 2], resp_data[offset - data_size + 3],
+                        resp_data[offset - data_size + 4], resp_data[offset - data_size + 5]);
+                OutputDebugStringA(dbg);
+            }
+        } else {
+            /* CAN protocols: First 4 bytes of data are CAN ID */
+            if (data_size >= 4) {
+                msgs[i].can_id = ((uint32_t)resp_data[offset] << 24) |
+                                 ((uint32_t)resp_data[offset + 1] << 16) |
+                                 ((uint32_t)resp_data[offset + 2] << 8) |
+                                 resp_data[offset + 3];
+                offset += 4;
+                data_size -= 4;
+            }
+            
+            /* Remaining is message data (can be up to 4124 for ISO-TP) */
+            msgs[i].data_len = (data_size > 4124) ? 4124 : data_size;
+            memcpy(msgs[i].data, &resp_data[offset], msgs[i].data_len);
+            offset += data_size;
+            
+            /* Set flags based on rx_status */
+            msgs[i].flags = 0;
+            if (rx_status & 0x100) {  /* CAN_29BIT_ID */
+                msgs[i].flags |= 0x01;
+            }
         }
-        
-        /* Remaining is message data (can be up to 4124 for ISO-TP) */
-        msgs[i].data_len = (data_size > 4124) ? 4124 : data_size;
-        memcpy(msgs[i].data, &resp_data[offset], msgs[i].data_len);
-        offset += data_size;
         
         /* Preserve full rx_status for J2534 (includes TX_MSG_TYPE=0x01 for TX echoes) */
         msgs[i].rx_status = rx_status;
-        
-        /* Set legacy flags from rx_status */
-        msgs[i].flags = 0;
-        if (rx_status & 0x100) {  /* CAN_29BIT_ID */
-            msgs[i].flags |= 0x01;
-        }
     }
     
     *num_msgs = msg_count;
@@ -1120,31 +1229,60 @@ bool wican_write_messages(wican_context_t *ctx, uint32_t channel_id, uint32_t pr
         data[offset++] = (tx_flags >> 8) & 0xFF;
         data[offset++] = tx_flags & 0xFF;
         
-        /* Data size: 4 bytes CAN ID + actual data bytes (can be up to 4124 for ISO-TP) */
-        uint32_t data_size = 4 + msgs[i].data_len;
-        data[offset++] = (data_size >> 24) & 0xFF;
-        data[offset++] = (data_size >> 16) & 0xFF;
-        data[offset++] = (data_size >> 8) & 0xFF;
-        data[offset++] = data_size & 0xFF;
+        /* Check if this is a legacy protocol message (flag 0x80) */
+        bool is_legacy_msg = (msgs[i].flags & 0x80) != 0;
         
-        /* CAN ID (first 4 bytes of J2534 message data) */
-        data[offset++] = (msgs[i].can_id >> 24) & 0xFF;
-        data[offset++] = (msgs[i].can_id >> 16) & 0xFF;
-        data[offset++] = (msgs[i].can_id >> 8) & 0xFF;
-        data[offset++] = msgs[i].can_id & 0xFF;
-        
-        /* Message data (can be up to 4124 bytes for ISO-TP multi-frame) */
-        uint16_t copy_len = msgs[i].data_len;
-        if (copy_len > 4124) copy_len = 4124;
-        memcpy(&data[offset], msgs[i].data, copy_len);
-        offset += copy_len;
-        
-        {
-            char dbg[256];
-            sprintf(dbg, "[WICAN] write_messages: ch=%lu CAN_ID=0x%08lX data_len=%u offset=%u\n", 
-                    channel_id, msgs[i].can_id, copy_len, offset);
-            OutputDebugStringA(dbg);
-            printf("%s", dbg);
+        if (is_legacy_msg) {
+            /* Legacy protocols (J1850, ISO9141, ISO14230):
+             * Data is raw message bytes (no CAN ID prefix)
+             * data_size = just the data length, no CAN ID */
+            uint32_t data_size = msgs[i].data_len;
+            data[offset++] = (data_size >> 24) & 0xFF;
+            data[offset++] = (data_size >> 16) & 0xFF;
+            data[offset++] = (data_size >> 8) & 0xFF;
+            data[offset++] = data_size & 0xFF;
+            
+            /* Copy raw data directly (no CAN ID prefix) */
+            uint16_t copy_len = msgs[i].data_len;
+            if (copy_len > 4124) copy_len = 4124;
+            memcpy(&data[offset], msgs[i].data, copy_len);
+            offset += copy_len;
+            
+            {
+                char dbg[256];
+                sprintf(dbg, "[WICAN] write_messages: LEGACY ch=%lu data_len=%u raw_data=%02X%02X%02X%02X\n", 
+                        channel_id, copy_len, 
+                        msgs[i].data[0], msgs[i].data[1], msgs[i].data[2], msgs[i].data[3]);
+                OutputDebugStringA(dbg);
+                printf("%s", dbg);
+            }
+        } else {
+            /* CAN protocols: Include 4-byte CAN ID prefix */
+            uint32_t data_size = 4 + msgs[i].data_len;
+            data[offset++] = (data_size >> 24) & 0xFF;
+            data[offset++] = (data_size >> 16) & 0xFF;
+            data[offset++] = (data_size >> 8) & 0xFF;
+            data[offset++] = data_size & 0xFF;
+            
+            /* CAN ID (first 4 bytes of J2534 message data) */
+            data[offset++] = (msgs[i].can_id >> 24) & 0xFF;
+            data[offset++] = (msgs[i].can_id >> 16) & 0xFF;
+            data[offset++] = (msgs[i].can_id >> 8) & 0xFF;
+            data[offset++] = msgs[i].can_id & 0xFF;
+            
+            /* Message data (can be up to 4124 bytes for ISO-TP multi-frame) */
+            uint16_t copy_len = msgs[i].data_len;
+            if (copy_len > 4124) copy_len = 4124;
+            memcpy(&data[offset], msgs[i].data, copy_len);
+            offset += copy_len;
+            
+            {
+                char dbg[256];
+                sprintf(dbg, "[WICAN] write_messages: CAN ch=%lu CAN_ID=0x%08lX data_len=%u offset=%u\n", 
+                        channel_id, msgs[i].can_id, copy_len, offset);
+                OutputDebugStringA(dbg);
+                printf("%s", dbg);
+            }
         }
         
         if (!wican_send_command(ctx, WICAN_CMD_WRITE_MSGS, data, offset)) {

@@ -1,8 +1,7 @@
 ﻿/*
  * This file is part of the WiCAN project.
  *
- * Copyright (C) 2022  Meatpi Electronics.
- * Written by Ali Slim <ali@meatpi.com>
+ * Copyright (C) 2025 Matt Deering
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

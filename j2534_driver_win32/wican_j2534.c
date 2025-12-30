@@ -1,3 +1,22 @@
+/*
+ * This file is part of the WiCAN project.
+ *
+ * Copyright (C) 2025 Matt Deering
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file wican_j2534.c
  * @brief WiCAN J2534 Pass-Thru Driver Implementation
@@ -10,6 +29,69 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <windows.h>
+
+/* ============================================================================
+ * Debug Logging
+ * ============================================================================ */
+static FILE *g_log_file = NULL;
+static CRITICAL_SECTION g_cs_log;
+static bool g_log_initialized = false;
+
+static void log_init(void)
+{
+    if (g_log_initialized) return;
+    
+    InitializeCriticalSection(&g_cs_log);
+    
+    char log_path[MAX_PATH];
+    char *temp = getenv("TEMP");
+    if (temp) {
+        snprintf(log_path, sizeof(log_path), "%s\\wican_j2534_debug.log", temp);
+    } else {
+        snprintf(log_path, sizeof(log_path), "C:\\wican_j2534_debug.log");
+    }
+    
+    g_log_file = fopen(log_path, "a");
+    if (g_log_file) {
+        time_t now = time(NULL);
+        fprintf(g_log_file, "\n=== WiCAN J2534 Debug Log Started: %s", ctime(&now));
+        fflush(g_log_file);
+    }
+    g_log_initialized = true;
+}
+
+static void log_msg(const char *fmt, ...)
+{
+    if (!g_log_file) return;
+    
+    EnterCriticalSection(&g_cs_log);
+    
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_log_file, "[%02d:%02d:%02d.%03d] ", 
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_log_file, fmt, args);
+    va_end(args);
+    
+    fprintf(g_log_file, "\n");
+    fflush(g_log_file);
+    
+    LeaveCriticalSection(&g_cs_log);
+}
+
+static void log_close(void)
+{
+    if (g_log_file) {
+        log_msg("=== Log closed ===");
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+}
 
 /* ============================================================================
  * Version Information
@@ -360,8 +442,10 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
     bool use_auto_connect = true;
     
     init_driver();
+    log_init();  /* Initialize debug logging */
     
     OutputDebugStringA("[J2534] PassThruOpen called\n");
+    log_msg("PassThruOpen called");
     
     if (!pDeviceID) {
         set_error("Null parameter: pDeviceID");
@@ -375,6 +459,7 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         char dbg[256];
         sprintf(dbg, "[J2534] PassThruOpen: pName='%s'\n", ip_address);
         OutputDebugStringA(dbg);
+        log_msg("PassThruOpen: pName='%s'", ip_address);
         
         /* Check if pName looks like a valid IP address (contains dots) */
         bool has_dots = false;
@@ -394,6 +479,7 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         LeaveCriticalSection(&g_cs_driver);
         set_error("No available device slots");
         OutputDebugStringA("[J2534] PassThruOpen: No available device slots\n");
+        log_msg("PassThruOpen: No available device slots");
         return ERR_DEVICE_IN_USE;
     }
     
@@ -403,6 +489,8 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         sprintf(dbg, "[J2534] PassThruOpen: connection attempt %d/%d (auto=%d)\n", 
                 retry_count + 1, max_retries, use_auto_connect);
         OutputDebugStringA(dbg);
+        log_msg("PassThruOpen: connection attempt %d/%d (auto=%d)", 
+                retry_count + 1, max_retries, use_auto_connect);
         
         bool connected = false;
         if (use_auto_connect) {
@@ -415,12 +503,14 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         
         if (connected) {
             OutputDebugStringA("[J2534] PassThruOpen: connection successful\n");
+            log_msg("PassThruOpen: TCP connection successful");
             break;  /* Connected successfully */
         }
         retry_count++;
         if (retry_count < max_retries) {
             sprintf(dbg, "[J2534] PassThruOpen: connect failed, waiting 1000ms before retry %d/%d\n", retry_count + 1, max_retries);
             OutputDebugStringA(dbg);
+            log_msg("PassThruOpen: connect failed, retry %d/%d", retry_count + 1, max_retries);
             Sleep(1000);  /* Wait 1000ms before retry - increased for ESP32 recovery */
         }
     }
@@ -430,6 +520,7 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to connect to WiCAN device");
         OutputDebugStringA("[J2534] PassThruOpen: Failed to connect after retries\n");
+        log_msg("PassThruOpen: FAILED - could not connect after %d retries", max_retries);
         return ERR_DEVICE_NOT_CONNECTED;
     }
     
@@ -440,10 +531,12 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to open J2534 device on WiCAN");
         OutputDebugStringA("[J2534] PassThruOpen: wican_device_open failed\n");
+        log_msg("PassThruOpen: FAILED - wican_device_open failed");
         return ERR_FAILED;
     }
     
     wican_get_info(&device->wican_ctx, device->fw_version, device->hw_version);
+    log_msg("PassThruOpen: FW=%s HW=%s", device->fw_version, device->hw_version);
     
     *pDeviceID = device->device_id;
     
@@ -451,6 +544,7 @@ long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
         char dbg[128];
         sprintf(dbg, "[J2534] PassThruOpen: SUCCESS, DeviceID=%lu\n", device->device_id);
         OutputDebugStringA(dbg);
+        log_msg("PassThruOpen: SUCCESS DeviceID=%lu", device->device_id);
     }
     
     LeaveCriticalSection(&g_cs_driver);
@@ -500,6 +594,8 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     sprintf(dbg, "[J2534] PassThruConnect: DeviceID=%lu ProtocolID=0x%lX Flags=0x%lX BaudRate=%lu\n",
             DeviceID, ProtocolID, Flags, BaudRate);
     OutputDebugStringA(dbg);
+    log_msg("PassThruConnect: DeviceID=%lu ProtocolID=0x%lX Flags=0x%lX BaudRate=%lu",
+            DeviceID, ProtocolID, Flags, BaudRate);
     
     if (!pChannelID) {
         set_error("Null parameter: pChannelID");
@@ -511,6 +607,7 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     if (proto_type == PROTO_TYPE_UNSUPPORTED) {
         sprintf(dbg, "[J2534] PassThruConnect: Unsupported protocol 0x%lX\n", ProtocolID);
         OutputDebugStringA(dbg);
+        log_msg("PassThruConnect: UNSUPPORTED protocol 0x%lX", ProtocolID);
         set_error("Unsupported protocol");
         return ERR_INVALID_PROTOCOL_ID;
     }
@@ -519,6 +616,8 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     sprintf(dbg, "[J2534] PassThruConnect: Protocol type=%s (0x%lX -> 0x%lX)\n",
             proto_names[proto_type], ProtocolID, (unsigned long)mapped_protocol);
     OutputDebugStringA(dbg);
+    log_msg("PassThruConnect: Protocol type=%s (0x%lX -> 0x%lX)",
+            proto_names[proto_type], ProtocolID, (unsigned long)mapped_protocol);
     
     EnterCriticalSection(&g_cs_driver);
     
@@ -526,6 +625,7 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     if (!device) {
         LeaveCriticalSection(&g_cs_driver);
         set_error("Invalid device ID");
+        log_msg("PassThruConnect: FAILED - invalid device ID");
         return ERR_INVALID_DEVICE_ID;
     }
     
@@ -533,14 +633,17 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     if (!channel) {
         LeaveCriticalSection(&g_cs_driver);
         set_error("No available channel slots");
+        log_msg("PassThruConnect: FAILED - no channel slots");
         return ERR_EXCEEDED_LIMIT;
     }
     
+    log_msg("PassThruConnect: Sending connect to firmware...");
     uint32_t fw_channel_id = 0;
     if (!wican_can_connect(&device->wican_ctx, mapped_protocol, Flags, BaudRate, &fw_channel_id)) {
         channel->in_use = false;
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to connect protocol channel");
+        log_msg("PassThruConnect: FAILED - firmware rejected connect");
         return ERR_FAILED;
     }
     
@@ -552,6 +655,9 @@ long __stdcall PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     channel->loopback = 0;
     
     *pChannelID = channel->channel_id;
+    
+    log_msg("PassThruConnect: SUCCESS ChannelID=%lu fw_channel=%lu", 
+            channel->channel_id, fw_channel_id);
     
     LeaveCriticalSection(&g_cs_driver);
     return STATUS_NOERROR;
@@ -595,6 +701,9 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     wican_can_msg_t can_msgs[32];
     uint32_t num_msgs;
     
+    log_msg("PassThruReadMsgs: ChannelID=%lu NumMsgs=%lu Timeout=%lu", 
+            ChannelID, pNumMsgs ? *pNumMsgs : 0, Timeout);
+    
     if (!pMsg || !pNumMsgs) {
         set_error("Null parameter");
         return ERR_NULL_PARAMETER;
@@ -631,11 +740,13 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
         sprintf(dbg, "[J2534] PassThruReadMsgs: Flushing %lu buffered writes before read\n",
                 channel->write_buf.count);
         OutputDebugStringA(dbg);
+        log_msg("PassThruReadMsgs: Flushing %lu buffered writes", channel->write_buf.count);
         
         uint32_t flushed = 0;
         if (!flush_write_buffer(device, channel, &flushed)) {
             /* Log error but continue with read attempt */
             OutputDebugStringA("[J2534] WARNING: Write buffer flush failed before read\n");
+            log_msg("PassThruReadMsgs: WARNING - flush failed");
         }
     }
     
@@ -645,6 +756,7 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
                              max_msgs, &num_msgs, Timeout)) {
         *pNumMsgs = 0;
         LeaveCriticalSection(&g_cs_driver);
+        log_msg("PassThruReadMsgs: BUFFER_EMPTY (timeout=%lu)", Timeout);
         return ERR_BUFFER_EMPTY;
     }
     
@@ -652,22 +764,49 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
         memset(&pMsg[i], 0, sizeof(PASSTHRU_MSG));
         pMsg[i].ProtocolID = channel->protocol_id;
         pMsg[i].Timestamp = can_msgs[i].timestamp;
-        pMsg[i].DataSize = 4 + can_msgs[i].data_len;
-        pMsg[i].ExtraDataIndex = pMsg[i].DataSize;
         
         /* Pass through full RxStatus from firmware - critical for TX_MSG_TYPE (0x01) */
         /* TX echoes have RxStatus=0x01 which diagnostic software needs for subnet discovery */
         pMsg[i].RxStatus = can_msgs[i].rx_status;
         
-        pMsg[i].Data[0] = (can_msgs[i].can_id >> 24) & 0xFF;
-        pMsg[i].Data[1] = (can_msgs[i].can_id >> 16) & 0xFF;
-        pMsg[i].Data[2] = (can_msgs[i].can_id >> 8) & 0xFF;
-        pMsg[i].Data[3] = can_msgs[i].can_id & 0xFF;
-        
-        memcpy(&pMsg[i].Data[4], can_msgs[i].data, can_msgs[i].data_len);
+        /* Check if this is a legacy protocol message (flag 0x80) */
+        if (can_msgs[i].flags & 0x80) {
+            /* Legacy protocols: Data is raw message bytes (no CAN ID prefix) 
+             * J1850VPW: [priority] [target] [source] [data...] */
+            pMsg[i].DataSize = can_msgs[i].data_len;
+            pMsg[i].ExtraDataIndex = pMsg[i].DataSize;
+            memcpy(pMsg[i].Data, can_msgs[i].data, can_msgs[i].data_len);
+            
+            log_msg("  RX[%u]: LEGACY len=%u RxStatus=0x%lX data=%02X%02X%02X%02X%02X%02X...",
+                    i, can_msgs[i].data_len, can_msgs[i].rx_status,
+                    can_msgs[i].data[0], can_msgs[i].data[1], 
+                    can_msgs[i].data[2], can_msgs[i].data[3],
+                    can_msgs[i].data[4], can_msgs[i].data[5]);
+        } else {
+            /* CAN protocols: Include 4-byte CAN ID prefix */
+            pMsg[i].DataSize = 4 + can_msgs[i].data_len;
+            pMsg[i].ExtraDataIndex = pMsg[i].DataSize;
+            
+            pMsg[i].Data[0] = (can_msgs[i].can_id >> 24) & 0xFF;
+            pMsg[i].Data[1] = (can_msgs[i].can_id >> 16) & 0xFF;
+            pMsg[i].Data[2] = (can_msgs[i].can_id >> 8) & 0xFF;
+            pMsg[i].Data[3] = can_msgs[i].can_id & 0xFF;
+            
+            memcpy(&pMsg[i].Data[4], can_msgs[i].data, can_msgs[i].data_len);
+            
+            /* Log each received message */
+            log_msg("  RX[%u]: ID=0x%08lX len=%u RxStatus=0x%lX data=%02X%02X%02X%02X...",
+                    i, can_msgs[i].can_id, can_msgs[i].data_len, can_msgs[i].rx_status,
+                    can_msgs[i].data[0], can_msgs[i].data[1], 
+                    can_msgs[i].data[2], can_msgs[i].data[3]);
+        }
     }
     
     *pNumMsgs = num_msgs;
+    
+    if (num_msgs > 0) {
+        log_msg("PassThruReadMsgs: Received %lu messages", num_msgs);
+    }
     
     LeaveCriticalSection(&g_cs_driver);
     
@@ -710,6 +849,14 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     }
     
     uint32_t num_msgs = (*pNumMsgs > 32) ? 32 : *pNumMsgs;
+    
+    /* Log each message being written */
+    for (uint32_t i = 0; i < num_msgs; i++) {
+        log_msg("PassThruWriteMsgs[%u]: DataSize=%lu TxFlags=0x%lX data=%02X%02X%02X%02X%02X%02X%02X%02X",
+                i, pMsg[i].DataSize, pMsg[i].TxFlags,
+                pMsg[i].Data[0], pMsg[i].Data[1], pMsg[i].Data[2], pMsg[i].Data[3],
+                pMsg[i].Data[4], pMsg[i].Data[5], pMsg[i].Data[6], pMsg[i].Data[7]);
+    }
     
     /* Check if this is a legacy protocol (J1850, ISO9141, ISO14230) */
     uint32_t mapped_proto = 0;
@@ -845,10 +992,12 @@ long __stdcall PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
         *pNumMsgs = num_sent;
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to write messages");
+        log_msg("PassThruWriteMsgs: FAILED (ERR_FAILED) sent=%lu", num_sent);
         return ERR_FAILED;
     }
     
     *pNumMsgs = num_sent;
+    log_msg("PassThruWriteMsgs: SUCCESS sent=%lu", num_sent);
     LeaveCriticalSection(&g_cs_driver);
     return STATUS_NOERROR;
 }

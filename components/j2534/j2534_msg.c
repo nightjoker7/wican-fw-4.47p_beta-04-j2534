@@ -1,8 +1,7 @@
 ﻿/*
  * This file is part of the WiCAN project.
  *
- * Copyright (C) 2022  Meatpi Electronics.
- * Written by Ali Slim <ali@meatpi.com>
+ * Copyright (C) 2025 Matt Deering
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,6 +30,7 @@
 #include "j2534_internal.h"
 #include "can.h"
 #include "stn_j2534.h"
+#include "stn_j2534_usdt.h"
 #include "hw_config.h"
 
 #define TAG J2534_TAG
@@ -110,6 +110,144 @@ j2534_error_t j2534_read_msgs(uint32_t channel_id, j2534_msg_t *msgs,
         j2534_set_error(J2534_ERR_NULL_PARAMETER, "NULL parameter");
         return J2534_ERR_NULL_PARAMETER;
     }
+
+#if HARDWARE_VER == WICAN_PRO
+    // Handle legacy protocol reads via STN monitor buffer
+    if (j2534_is_legacy_protocol(ch->protocol_id)) {
+        uint32_t requested = *num_msgs;
+        uint32_t read_count = 0;
+        TickType_t start = xTaskGetTickCount();
+        TickType_t timeout_ticks = pdMS_TO_TICKS(timeout);
+        
+        ESP_LOGI(TAG, "J1850 ReadMsgs: requested=%lu timeout=%lu", requested, timeout);
+        
+        // First check our internal buffer
+        while (read_count < requested && j2534_rx_msg_head != j2534_rx_msg_tail) {
+            memcpy(&msgs[read_count], &j2534_rx_msg_buffer[j2534_rx_msg_tail],
+                   sizeof(j2534_msg_t));
+            j2534_rx_msg_tail = (j2534_rx_msg_tail + 1) % j2534_rx_msg_buffer_actual_size;
+            read_count++;
+        }
+        
+        // Then poll STN monitor buffer for new messages
+        // Use static buffer for USDT reassembly (header + data)
+        static uint8_t usdt_complete_msg[4096 + 3];  // Max USDT buffer + header
+        
+        while (read_count < requested) {
+            stn_j2534_msg_t stn_msgs[8];
+            uint32_t num_stn_msgs = 0;
+            
+            stn_j2534_status_t status = stn_j2534_read_msgs(stn_msgs, 8, &num_stn_msgs);
+            
+            if (num_stn_msgs > 0) {
+                ESP_LOGI(TAG, "J1850 ReadMsgs: got %lu from STN monitor", num_stn_msgs);
+                
+                for (uint32_t i = 0; i < num_stn_msgs && read_count < requested; i++) {
+                    // Check if this is a USDT frame that needs reassembly
+                    #define J1850_HEADER_SIZE_RX 3
+                    
+                    if (stn_msgs[i].data_len > J1850_HEADER_SIZE_RX) {
+                        uint8_t pci = stn_msgs[i].data[J1850_HEADER_SIZE_RX];
+                        usdt_frame_type_t frame_type = usdt_get_frame_type(pci);
+                        
+                        // Check if multi-frame (FF or CF)
+                        if (frame_type == USDT_FRAME_FF || frame_type == USDT_FRAME_CF) {
+                            uint32_t complete_len = 0;
+                            
+                            bool complete = usdt_process_rx_frame(
+                                stn_msgs[i].data,
+                                stn_msgs[i].data_len,
+                                usdt_complete_msg,
+                                &complete_len
+                            );
+                            
+                            if (complete && complete_len > 0) {
+                                // Reassembled message ready
+                                msgs[read_count].protocol_id = ch->protocol_id;
+                                msgs[read_count].rx_status = 0;
+                                msgs[read_count].timestamp = stn_msgs[i].timestamp;
+                                msgs[read_count].data_size = complete_len;
+                                
+                                // Cap at buffer size
+                                if (complete_len > sizeof(msgs[read_count].data)) {
+                                    complete_len = sizeof(msgs[read_count].data);
+                                }
+                                memcpy(msgs[read_count].data, usdt_complete_msg, complete_len);
+                                msgs[read_count].extra_data_index = complete_len;
+                                
+                                ESP_LOGI(TAG, "J1850 USDT RX complete: len=%lu", complete_len);
+                                read_count++;
+                            } else {
+                                // Still accumulating CF frames, or FC sent
+                                ESP_LOGI(TAG, "J1850 USDT RX: frame processed, waiting for more");
+                            }
+                            continue;  // Don't buffer raw FF/CF frames
+                        }
+                        
+                        // Check for FC frame - just log and skip
+                        if (frame_type == USDT_FRAME_FC) {
+                            // Process FC to update TX state
+                            usdt_process_rx_frame(
+                                stn_msgs[i].data,
+                                stn_msgs[i].data_len,
+                                usdt_complete_msg,
+                                &(uint32_t){0}
+                            );
+                            ESP_LOGI(TAG, "J1850 FC received and processed");
+                            continue;  // Don't buffer FC frames
+                        }
+                    }
+                    
+                    // Single frame or other - buffer directly
+                    msgs[read_count].protocol_id = ch->protocol_id;
+                    msgs[read_count].rx_status = 0;
+                    msgs[read_count].timestamp = stn_msgs[i].timestamp;
+                    msgs[read_count].data_size = stn_msgs[i].data_len;
+                    memcpy(msgs[read_count].data, stn_msgs[i].data, stn_msgs[i].data_len);
+                    msgs[read_count].extra_data_index = stn_msgs[i].data_len;
+                    
+                    ESP_LOGI(TAG, "J1850 RX[%lu]: len=%lu data=%02X%02X%02X%02X...",
+                             read_count, msgs[read_count].data_size,
+                             msgs[read_count].data[0], msgs[read_count].data[1],
+                             msgs[read_count].data[2], msgs[read_count].data[3]);
+                    
+                    read_count++;
+                }
+            }
+            
+            // Check if USDT RX is in progress - extend timeout if needed
+            if (usdt_rx_in_progress()) {
+                // Keep polling while multi-frame reception is active
+                TickType_t elapsed = xTaskGetTickCount() - start;
+                if (elapsed >= timeout_ticks + pdMS_TO_TICKS(2000)) {
+                    ESP_LOGW(TAG, "J1850 USDT RX timeout");
+                    usdt_reset();
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(5));  // Faster polling during multi-frame
+                continue;
+            }
+            
+            // Check timeout
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout_ticks) {
+                break;
+            }
+            
+            if (num_stn_msgs == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));  // Small delay before retry
+            }
+        }
+        
+        *num_msgs = read_count;
+        ESP_LOGI(TAG, "J1850 ReadMsgs: returning %lu messages", read_count);
+        
+        if (read_count == 0) {
+            return J2534_ERR_BUFFER_EMPTY;
+        }
+        return J2534_STATUS_NOERROR;
+    }
+#endif
 
     // CRITICAL FIX: Also switch active channel on READ, not just write!
     if (j2534_active_channel != channel_id) {
@@ -260,41 +398,140 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
 #if HARDWARE_VER == WICAN_PRO
     // Handle legacy protocols through OBD chip
     if (j2534_is_legacy_protocol(ch->protocol_id)) {
+        ESP_LOGI(TAG, "J1850 WriteMsgs: %lu msgs, timeout=%lu", requested, timeout);
+        
+        // Initialize USDT if not already done
+        usdt_init();
+        
         for (uint32_t i = 0; i < requested; i++) {
             stn_j2534_msg_t responses[4];
             uint32_t num_responses = 0;
+            
+            // Log the TX message
+            ESP_LOGI(TAG, "J1850 TX[%lu]: size=%lu data=%02X%02X%02X%02X%02X%02X%02X%02X",
+                     i, msgs[i].data_size,
+                     msgs[i].data[0], msgs[i].data[1], msgs[i].data[2], msgs[i].data[3],
+                     msgs[i].data[4], msgs[i].data[5], msgs[i].data[6], msgs[i].data[7]);
 
-            stn_j2534_status_t status = stn_j2534_send_message(
-                msgs[i].data,
-                msgs[i].data_size,
-                responses,
-                4,
-                &num_responses,
-                timeout > 0 ? timeout : 1000
-            );
-
-            if (status == STN_J2534_STATUS_OK || num_responses > 0) {
-                sent_count++;
-
-                // Buffer responses as RX messages
-                for (uint32_t r = 0; r < num_responses; r++) {
-                    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
-                    if (next_head != j2534_rx_msg_tail) {
-                        j2534_msg_t *rx_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
-                        memset(rx_msg, 0, sizeof(j2534_msg_t));
-                        rx_msg->protocol_id = ch->protocol_id;
-                        rx_msg->rx_status = 0;
-                        rx_msg->timestamp = responses[r].timestamp;
-                        rx_msg->data_size = responses[r].data_len;
-                        memcpy(rx_msg->data, responses[r].data, responses[r].data_len);
-                        j2534_rx_msg_head = next_head;
-                    }
+            stn_j2534_status_t status;
+            
+            // J1850 message format: [Header 3 bytes] [Data N bytes]
+            // Header: Priority, Target, Source
+            // If data portion > 6 bytes, need USDT multi-frame
+            #define J1850_HEADER_SIZE 3
+            #define J1850_SF_DATA_MAX 6
+            
+            uint32_t data_len = msgs[i].data_size - J1850_HEADER_SIZE;
+            
+            if (msgs[i].data_size > J1850_HEADER_SIZE && data_len > J1850_SF_DATA_MAX) {
+                // Multi-frame needed - use USDT
+                ESP_LOGI(TAG, "J1850 USDT TX: header=%02X%02X%02X data_len=%lu",
+                         msgs[i].data[0], msgs[i].data[1], msgs[i].data[2], data_len);
+                
+                status = usdt_send_message(
+                    msgs[i].data,                    // First 3 bytes are header
+                    msgs[i].data + J1850_HEADER_SIZE, // Data starts after header
+                    data_len,
+                    timeout > 0 ? timeout : 2000     // Longer timeout for multi-frame
+                );
+                
+                if (status == STN_J2534_STATUS_OK) {
+                    sent_count++;
+                    j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+                    ESP_LOGI(TAG, "J1850 USDT TX complete");
+                } else {
+                    ESP_LOGE(TAG, "J1850 USDT TX failed: status=%d", status);
                 }
+                
+                // Note: Multi-frame responses will come via separate ReadMsgs calls
+                // The USDT RX state machine handles reassembly
+                
+            } else {
+                // Single frame - use existing path
+                status = stn_j2534_send_message(
+                    msgs[i].data,
+                    msgs[i].data_size,
+                    responses,
+                    4,
+                    &num_responses,
+                    timeout > 0 ? timeout : 1000
+                );
+                
+                ESP_LOGI(TAG, "J1850 stn_send_message: status=%d num_responses=%lu", status, num_responses);
 
-                j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+                if (status == STN_J2534_STATUS_OK || num_responses > 0) {
+                    sent_count++;
+
+                    // Buffer responses as RX messages (may include USDT frames)
+                    for (uint32_t r = 0; r < num_responses; r++) {
+                        ESP_LOGI(TAG, "J1850 RX[%lu]: len=%lu data=%02X%02X%02X%02X%02X%02X%02X%02X",
+                                 r, responses[r].data_len,
+                                 responses[r].data[0], responses[r].data[1], 
+                                 responses[r].data[2], responses[r].data[3],
+                                 responses[r].data[4], responses[r].data[5],
+                                 responses[r].data[6], responses[r].data[7]);
+                        
+                        // Check if this is a USDT frame that needs reassembly
+                        if (responses[r].data_len > J1850_HEADER_SIZE) {
+                            uint8_t pci = responses[r].data[J1850_HEADER_SIZE];
+                            usdt_frame_type_t frame_type = usdt_get_frame_type(pci);
+                            
+                            if (frame_type == USDT_FRAME_FF || frame_type == USDT_FRAME_CF) {
+                                // Multi-frame response - process via USDT
+                                static uint8_t complete_msg[4096];
+                                uint32_t complete_len = 0;
+                                
+                                bool complete = usdt_process_rx_frame(
+                                    responses[r].data,
+                                    responses[r].data_len,
+                                    complete_msg,
+                                    &complete_len
+                                );
+                                
+                                if (complete && complete_len > 0) {
+                                    // Reassembled message ready - buffer it
+                                    uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
+                                    if (next_head != j2534_rx_msg_tail) {
+                                        j2534_msg_t *rx_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+                                        memset(rx_msg, 0, sizeof(j2534_msg_t));
+                                        rx_msg->protocol_id = ch->protocol_id;
+                                        rx_msg->rx_status = 0;
+                                        rx_msg->timestamp = responses[r].timestamp;
+                                        rx_msg->data_size = complete_len;
+                                        memcpy(rx_msg->data, complete_msg, complete_len);
+                                        j2534_rx_msg_head = next_head;
+                                        ESP_LOGI(TAG, "J1850 USDT RX complete: len=%lu", complete_len);
+                                    }
+                                }
+                                continue;  // Don't buffer raw CF/FF frames
+                            }
+                        }
+                        
+                        // Single frame or other - buffer directly
+                        uint32_t next_head = (j2534_rx_msg_head + 1) % j2534_rx_msg_buffer_actual_size;
+                        if (next_head != j2534_rx_msg_tail) {
+                            j2534_msg_t *rx_msg = &j2534_rx_msg_buffer[j2534_rx_msg_head];
+                            memset(rx_msg, 0, sizeof(j2534_msg_t));
+                            rx_msg->protocol_id = ch->protocol_id;
+                            rx_msg->rx_status = 0;
+                            rx_msg->timestamp = responses[r].timestamp;
+                            rx_msg->data_size = responses[r].data_len;
+                            memcpy(rx_msg->data, responses[r].data, responses[r].data_len);
+                            j2534_rx_msg_head = next_head;
+                            ESP_LOGI(TAG, "J1850 RX buffered: head=%lu tail=%lu", j2534_rx_msg_head, j2534_rx_msg_tail);
+                        } else {
+                            ESP_LOGW(TAG, "J1850 RX buffer full!");
+                        }
+                    }
+
+                    j2534_buffer_tx_indication(&msgs[i], ch->protocol_id);
+                } else {
+                    ESP_LOGW(TAG, "J1850 TX failed: status=%d", status);
+                }
             }
         }
 
+        ESP_LOGI(TAG, "J1850 WriteMsgs done: sent=%lu", sent_count);
         *num_msgs = sent_count;
         return J2534_STATUS_NOERROR;
     }

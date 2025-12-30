@@ -1,8 +1,7 @@
 /*
  * This file is part of the WiCAN project.
  *
- * Copyright (C) 2022  Meatpi Electronics.
- * Written by Ali Slim <ali@meatpi.com>
+ * Copyright (C) 2025 Matt Deering
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,9 +30,30 @@
 #include "j2534_internal.h"
 #include "can.h"
 #include "stn_j2534.h"
+#include "stn_j2534_usdt.h"
 #include "hw_config.h"
 
 #define TAG J2534_TAG
+
+/* ============================================================================
+ * Legacy Protocol Callback
+ * ============================================================================ */
+
+static j2534_legacy_deinit_callback_t s_legacy_deinit_callback = NULL;
+
+void j2534_register_legacy_deinit_callback(j2534_legacy_deinit_callback_t callback)
+{
+    s_legacy_deinit_callback = callback;
+    ESP_LOGI(TAG, "Legacy deinit callback registered");
+}
+
+// Helper to call the legacy deinit callback safely
+static void call_legacy_deinit(void)
+{
+    if (s_legacy_deinit_callback) {
+        s_legacy_deinit_callback();
+    }
+}
 
 /* ============================================================================
  * Channel Connect/Disconnect
@@ -168,6 +188,7 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
         esp_err_t init_err = stn_j2534_init();
         if (init_err != ESP_OK) {
             ch->active = false;  // Free the channel on failure
+            call_legacy_deinit();  // CRITICAL: Re-enable elm327_read_task on failure
             j2534_set_error(J2534_ERR_FAILED, "OBD chip not ready");
             ESP_LOGE(TAG, "stn_j2534_init() failed with error %d", init_err);
             return J2534_ERR_FAILED;
@@ -177,10 +198,15 @@ j2534_error_t j2534_connect(uint32_t device_id, uint32_t protocol_id,
         stn_j2534_status_t status = stn_j2534_select_protocol(stn_proto);
         if (status != STN_J2534_STATUS_OK) {
             ch->active = false;  // Free the channel on failure
+            call_legacy_deinit();  // CRITICAL: Re-enable elm327_read_task on failure
             j2534_set_error(J2534_ERR_FAILED, "Failed to select protocol on OBD chip");
             ESP_LOGE(TAG, "stn_j2534_select_protocol() failed with status %d", status);
             return J2534_ERR_FAILED;
         }
+        
+        // Initialize USDT for multi-frame support (GM SPS programming)
+        usdt_init();
+        ESP_LOGI(TAG, "USDT initialized for J1850 multi-frame support");
 
         // Disable CAN since we're using legacy protocol
         can_disable();
@@ -262,8 +288,10 @@ j2534_error_t j2534_disconnect(uint32_t channel_id)
     // Stop KWP keep-alive if active
     if (j2534_is_legacy_protocol(ch->protocol_id)) {
         stn_j2534_stop_keep_alive();
+        // Deinitialize USDT multi-frame support
+        usdt_deinit();
         // Deinitialize STN-J2534 bridge and re-enable elm327_read_task
-        stn_j2534_deinit();
+        call_legacy_deinit();
     }
 #endif
 
