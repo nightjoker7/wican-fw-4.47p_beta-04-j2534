@@ -25,6 +25,7 @@
 #include "wican_comm.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 #include <setupapi.h>
 
 #pragma comment(lib, "setupapi.lib")
@@ -163,6 +164,10 @@ bool wican_connect(wican_context_t *ctx, const char *ip_address, uint16_t port)
     memset(ctx, 0, sizeof(wican_context_t));
     InitializeCriticalSection(&ctx->cs_socket);
     
+    /* Initialize robustness fields */
+    ctx->hLogFile = INVALID_HANDLE_VALUE;
+    ctx->auto_reconnect = true;  /* Enable by default */
+    
     /* Check if ip_address looks like an IP address (contains a dot) */
     bool is_valid_ip = false;
     if (ip_address && ip_address[0]) {
@@ -272,6 +277,7 @@ bool wican_connect(wican_context_t *ctx, const char *ip_address, uint16_t port)
 
     ctx->transport_type = WICAN_TRANSPORT_TCP;
     ctx->connected = true;
+    ctx->last_activity_time = GetTickCount();
     return true;
 }
 
@@ -363,6 +369,10 @@ bool wican_connect_usb(wican_context_t *ctx, const char *com_port, uint32_t baud
     InitializeCriticalSection(&ctx->cs_socket);
     ctx->socket = INVALID_SOCKET;
     ctx->hSerial = INVALID_HANDLE_VALUE;
+    
+    /* Initialize robustness fields */
+    ctx->hLogFile = INVALID_HANDLE_VALUE;
+    ctx->auto_reconnect = true;
     
     /* Determine which COM port to use */
     if (com_port && com_port[0]) {
@@ -490,6 +500,7 @@ bool wican_connect_usb(wican_context_t *ctx, const char *com_port, uint32_t baud
     
     ctx->transport_type = WICAN_TRANSPORT_USB;
     ctx->connected = true;
+    ctx->last_activity_time = GetTickCount();
     
     OutputDebugStringA("[WICAN] wican_connect_usb: SUCCESS\n");
     return true;
@@ -548,6 +559,13 @@ void wican_disconnect(wican_context_t *ctx)
         }
     }
     ctx->connected = false;
+    
+    /* Close log file if open */
+    if (ctx->hLogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->hLogFile);
+        ctx->hLogFile = INVALID_HANDLE_VALUE;
+    }
+    ctx->log_to_file = false;
     
     LeaveCriticalSection(&ctx->cs_socket);
     DeleteCriticalSection(&ctx->cs_socket);
@@ -622,8 +640,12 @@ bool wican_send_command(wican_context_t *ctx, uint8_t cmd, const uint8_t *data, 
             char dbg[128];
             sprintf(dbg, "wican_send_command: WriteFile failed, written=%lu, error=%lu\n", bytes_written, GetLastError());
             OutputDebugStringA(dbg);
+            ctx->consecutive_errors++;
+            ctx->total_errors++;
             return false;
         }
+        ctx->last_activity_time = GetTickCount();
+        ctx->consecutive_errors = 0;
         return true;
     } else {
         /* TCP transport */
@@ -634,8 +656,12 @@ bool wican_send_command(wican_context_t *ctx, uint8_t cmd, const uint8_t *data, 
             char dbg[128];
             sprintf(dbg, "wican_send_command: send failed, sent=%d, error=%d\n", sent, WSAGetLastError());
             OutputDebugStringA(dbg);
+            ctx->consecutive_errors++;
+            ctx->total_errors++;
             return false;
         }
+        ctx->last_activity_time = GetTickCount();
+        ctx->consecutive_errors = 0;
         return true;
     }
 }
@@ -770,17 +796,23 @@ bool wican_receive_response(wican_context_t *ctx, uint8_t *cmd, uint8_t *status,
         setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
     }
     LeaveCriticalSection(&ctx->cs_socket);
+    ctx->last_activity_time = GetTickCount();
+    ctx->consecutive_errors = 0;
     OutputDebugStringA("wican_receive_response: success\n");
     return true;
     
 error_usb:
     SetCommTimeouts(ctx->hSerial, &old_timeouts);
     LeaveCriticalSection(&ctx->cs_socket);
+    ctx->consecutive_errors++;
+    ctx->total_errors++;
     return false;
     
 error_tcp:
     setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
     LeaveCriticalSection(&ctx->cs_socket);
+    ctx->consecutive_errors++;
+    ctx->total_errors++;
     return false;
 }
 
@@ -1901,4 +1933,322 @@ bool wican_stop_periodic_msg(wican_context_t *ctx, uint32_t channel_id, uint32_t
     
     OutputDebugStringA("[WICAN] wican_stop_periodic_msg: success\n");
     return true;
+}
+
+/* ============================================================================
+ * Robustness Functions
+ * ============================================================================ */
+
+/* Internal logging function */
+void wican_log(wican_context_t *ctx, const char *format, ...)
+{
+    char buffer[512];
+    char timestamp[32];
+    SYSTEMTIME st;
+    va_list args;
+    
+    GetLocalTime(&st);
+    sprintf(timestamp, "[%02d:%02d:%02d.%03d] ", 
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer) - 1, format, args);
+    va_end(args);
+    buffer[sizeof(buffer) - 1] = '\0';
+    
+    /* Always output to debug console */
+    OutputDebugStringA(timestamp);
+    OutputDebugStringA(buffer);
+    
+    /* Optionally write to file */
+    if (ctx && ctx->log_to_file && ctx->hLogFile != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(ctx->hLogFile, timestamp, (DWORD)strlen(timestamp), &written, NULL);
+        WriteFile(ctx->hLogFile, buffer, (DWORD)strlen(buffer), &written, NULL);
+        FlushFileBuffers(ctx->hLogFile);
+    }
+}
+
+bool wican_enable_logging(wican_context_t *ctx, const char *log_path)
+{
+    if (!ctx) return false;
+    
+    /* Close existing log file if open */
+    if (ctx->hLogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->hLogFile);
+        ctx->hLogFile = INVALID_HANDLE_VALUE;
+    }
+    
+    if (!log_path || !log_path[0]) {
+        ctx->log_to_file = false;
+        return true;
+    }
+    
+    ctx->hLogFile = CreateFileA(log_path, GENERIC_WRITE, FILE_SHARE_READ,
+                                 NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    
+    if (ctx->hLogFile == INVALID_HANDLE_VALUE) {
+        ctx->log_to_file = false;
+        return false;
+    }
+    
+    ctx->log_to_file = true;
+    wican_log(ctx, "[WICAN] Debug logging started to: %s\n", log_path);
+    return true;
+}
+
+void wican_disable_logging(wican_context_t *ctx)
+{
+    if (!ctx) return;
+    
+    if (ctx->hLogFile != INVALID_HANDLE_VALUE) {
+        wican_log(ctx, "[WICAN] Debug logging stopped\n");
+        CloseHandle(ctx->hLogFile);
+        ctx->hLogFile = INVALID_HANDLE_VALUE;
+    }
+    ctx->log_to_file = false;
+}
+
+bool wican_connect_with_retry(wican_context_t *ctx, const char *ip_address, 
+                               uint16_t port, int max_retries)
+{
+    int retries = (max_retries > 0) ? max_retries : WICAN_MAX_CONNECT_RETRIES;
+    int delay_ms = WICAN_RETRY_DELAY_BASE_MS;
+    bool success = false;
+    
+    if (!ctx) return false;
+    
+    wican_log(ctx, "[WICAN] connect_with_retry: max_retries=%d, ip=%s, port=%d\n",
+              retries, ip_address ? ip_address : "(default)", port);
+    
+    ctx->connect_attempts = 0;
+    
+    for (int attempt = 1; attempt <= retries; attempt++) {
+        ctx->connect_attempts = attempt;
+        
+        wican_log(ctx, "[WICAN] Connection attempt %d/%d...\n", attempt, retries);
+        
+        /* Try TCP connection */
+        success = wican_connect(ctx, ip_address, port);
+        
+        if (success) {
+            wican_log(ctx, "[WICAN] Connected on attempt %d\n", attempt);
+            ctx->last_activity_time = GetTickCount();
+            ctx->consecutive_errors = 0;
+            return true;
+        }
+        
+        /* Not the last attempt - wait before retry */
+        if (attempt < retries) {
+            wican_log(ctx, "[WICAN] Connection failed, waiting %d ms before retry...\n", delay_ms);
+            Sleep(delay_ms);
+            
+            /* Exponential backoff */
+            delay_ms *= 2;
+            if (delay_ms > WICAN_RETRY_DELAY_MAX_MS) {
+                delay_ms = WICAN_RETRY_DELAY_MAX_MS;
+            }
+        }
+    }
+    
+    wican_log(ctx, "[WICAN] All %d connection attempts failed\n", retries);
+    return false;
+}
+
+void wican_set_auto_reconnect(wican_context_t *ctx, bool enable)
+{
+    if (!ctx) return;
+    ctx->auto_reconnect = enable;
+    wican_log(ctx, "[WICAN] Auto-reconnect %s\n", enable ? "enabled" : "disabled");
+}
+
+bool wican_reconnect(wican_context_t *ctx)
+{
+    DWORD now;
+    
+    if (!ctx) return false;
+    
+    now = GetTickCount();
+    
+    /* Enforce cooldown between reconnect attempts */
+    if (ctx->last_reconnect_time > 0 && 
+        (now - ctx->last_reconnect_time) < WICAN_RECONNECT_COOLDOWN_MS) {
+        wican_log(ctx, "[WICAN] Reconnect cooldown active, skipping\n");
+        return false;
+    }
+    
+    ctx->last_reconnect_time = now;
+    ctx->reconnect_count++;
+    
+    wican_log(ctx, "[WICAN] Attempting reconnection (attempt #%lu)...\n", ctx->reconnect_count);
+    
+    /* Close existing connection */
+    if (ctx->connected) {
+        if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+            if (ctx->hSerial != INVALID_HANDLE_VALUE) {
+                CloseHandle(ctx->hSerial);
+                ctx->hSerial = INVALID_HANDLE_VALUE;
+            }
+        } else {
+            if (ctx->socket != INVALID_SOCKET) {
+                closesocket(ctx->socket);
+                ctx->socket = INVALID_SOCKET;
+            }
+        }
+        ctx->connected = false;
+    }
+    
+    /* Short delay before reconnecting */
+    Sleep(100);
+    
+    /* Try to reconnect based on original transport type */
+    bool success;
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        success = wican_connect_usb(ctx, ctx->com_port, ctx->serial_baudrate);
+    } else {
+        success = wican_connect_with_retry(ctx, ctx->ip_address, ctx->port, 2);
+    }
+    
+    if (success) {
+        wican_log(ctx, "[WICAN] Reconnection successful\n");
+        ctx->consecutive_errors = 0;
+        ctx->last_activity_time = GetTickCount();
+    } else {
+        wican_log(ctx, "[WICAN] Reconnection failed\n");
+    }
+    
+    return success;
+}
+
+bool wican_check_connection(wican_context_t *ctx)
+{
+    uint8_t resp_data[256];
+    uint16_t resp_len = sizeof(resp_data);
+    uint8_t resp_cmd, resp_status;
+    DWORD old_timeout;
+    int opt_len = sizeof(old_timeout);
+    
+    if (!ctx || !ctx->connected) {
+        return false;
+    }
+    
+    wican_log(ctx, "[WICAN] Checking connection health...\n");
+    
+    /* Send a READ_VERSION command as heartbeat - it's lightweight */
+    if (!wican_send_command(ctx, WICAN_CMD_READ_VERSION, NULL, 0)) {
+        wican_log(ctx, "[WICAN] Heartbeat send failed\n");
+        ctx->consecutive_errors++;
+        ctx->total_errors++;
+        
+        if (ctx->auto_reconnect) {
+            return wican_reconnect(ctx);
+        }
+        return false;
+    }
+    
+    /* Temporarily set shorter timeout for heartbeat */
+    if (ctx->transport_type == WICAN_TRANSPORT_TCP) {
+        getsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&old_timeout, &opt_len);
+        DWORD new_timeout = WICAN_HEARTBEAT_TIMEOUT_MS;
+        setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&new_timeout, sizeof(new_timeout));
+    }
+    
+    bool success = wican_receive_response(ctx, &resp_cmd, &resp_status, 
+                                          resp_data, &resp_len, WICAN_HEARTBEAT_TIMEOUT_MS);
+    
+    /* Restore original timeout */
+    if (ctx->transport_type == WICAN_TRANSPORT_TCP) {
+        setsockopt(ctx->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&old_timeout, sizeof(old_timeout));
+    }
+    
+    if (success && resp_status == WICAN_RESP_OK) {
+        ctx->last_activity_time = GetTickCount();
+        ctx->consecutive_errors = 0;
+        wican_log(ctx, "[WICAN] Connection healthy\n");
+        return true;
+    }
+    
+    wican_log(ctx, "[WICAN] Heartbeat failed - connection may be lost\n");
+    ctx->consecutive_errors++;
+    ctx->total_errors++;
+    
+    if (ctx->auto_reconnect) {
+        return wican_reconnect(ctx);
+    }
+    
+    return false;
+}
+
+bool wican_resync(wican_context_t *ctx)
+{
+    uint8_t discard_buf[256];
+    int attempts = 0;
+    
+    if (!ctx || !ctx->connected) {
+        return false;
+    }
+    
+    wican_log(ctx, "[WICAN] Attempting protocol resync...\n");
+    ctx->resync_count++;
+    
+    if (ctx->transport_type == WICAN_TRANSPORT_USB) {
+        /* USB: Purge buffers */
+        PurgeComm(ctx->hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
+        wican_log(ctx, "[WICAN] USB buffers purged\n");
+    } else {
+        /* TCP: Read and discard any pending data */
+        u_long avail = 0;
+        ioctlsocket(ctx->socket, FIONREAD, &avail);
+        
+        while (avail > 0 && attempts < WICAN_MAX_RESYNC_ATTEMPTS) {
+            int to_read = (avail > sizeof(discard_buf)) ? sizeof(discard_buf) : (int)avail;
+            int read_result = recv(ctx->socket, (char*)discard_buf, to_read, 0);
+            
+            if (read_result <= 0) break;
+            
+            wican_log(ctx, "[WICAN] Discarded %d bytes of stale data\n", read_result);
+            
+            ioctlsocket(ctx->socket, FIONREAD, &avail);
+            attempts++;
+        }
+    }
+    
+    /* Try a simple command to verify we're back in sync */
+    uint8_t resp_data[256];
+    uint16_t resp_len = sizeof(resp_data);
+    uint8_t resp_cmd, resp_status;
+    
+    if (wican_send_command(ctx, WICAN_CMD_READ_VERSION, NULL, 0) &&
+        wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, 2000)) {
+        
+        if (resp_status == WICAN_RESP_OK) {
+            wican_log(ctx, "[WICAN] Protocol resync successful\n");
+            ctx->consecutive_errors = 0;
+            return true;
+        }
+    }
+    
+    wican_log(ctx, "[WICAN] Protocol resync failed\n");
+    
+    /* If resync failed and auto-reconnect is enabled, try full reconnect */
+    if (ctx->auto_reconnect) {
+        return wican_reconnect(ctx);
+    }
+    
+    return false;
+}
+
+void wican_get_stats(wican_context_t *ctx, uint32_t *reconnect_count,
+                     uint32_t *error_count, uint32_t *resync_count)
+{
+    if (!ctx) {
+        if (reconnect_count) *reconnect_count = 0;
+        if (error_count) *error_count = 0;
+        if (resync_count) *resync_count = 0;
+        return;
+    }
+    
+    if (reconnect_count) *reconnect_count = ctx->reconnect_count;
+    if (error_count) *error_count = ctx->total_errors;
+    if (resync_count) *resync_count = ctx->resync_count;
 }

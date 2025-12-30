@@ -52,6 +52,15 @@ extern "C" {
 #define WICAN_CONNECT_TIMEOUT_MS    5000
 #define WICAN_READ_TIMEOUT_MS       1000
 
+/* Robustness settings */
+#define WICAN_MAX_CONNECT_RETRIES   3       /* Maximum connection attempts */
+#define WICAN_RETRY_DELAY_BASE_MS   500     /* Base delay between retries (exponential backoff) */
+#define WICAN_RETRY_DELAY_MAX_MS    4000    /* Maximum retry delay */
+#define WICAN_HEARTBEAT_INTERVAL_MS 5000    /* Heartbeat check interval */
+#define WICAN_HEARTBEAT_TIMEOUT_MS  2000    /* Heartbeat response timeout */
+#define WICAN_MAX_RESYNC_ATTEMPTS   5       /* Max attempts to resync protocol after error */
+#define WICAN_RECONNECT_COOLDOWN_MS 1000    /* Cooldown between reconnection attempts */
+
 /* Transport types */
 #define WICAN_TRANSPORT_TCP         0
 #define WICAN_TRANSPORT_USB         1
@@ -118,6 +127,22 @@ typedef struct {
     bool connected;
     CRITICAL_SECTION cs_socket;
     uint32_t device_id;
+    
+    /* Robustness - connection state */
+    uint32_t connect_attempts;    /* Number of connection attempts made */
+    uint32_t reconnect_count;     /* Total reconnections since init */
+    DWORD last_activity_time;     /* GetTickCount() of last successful I/O */
+    DWORD last_reconnect_time;    /* GetTickCount() of last reconnect attempt */
+    bool auto_reconnect;          /* Enable automatic reconnection */
+    
+    /* Robustness - error tracking */
+    uint32_t consecutive_errors;  /* Consecutive communication errors */
+    uint32_t total_errors;        /* Total errors since init */
+    uint32_t resync_count;        /* Number of protocol resyncs performed */
+    
+    /* Debug logging */
+    HANDLE hLogFile;              /* File handle for debug logging (NULL = disabled) */
+    bool log_to_file;             /* Enable file logging */
 } wican_context_t;
 
 /* WiCAN message structure (matches firmware) */
@@ -399,6 +424,80 @@ bool wican_start_periodic_msg(wican_context_t *ctx, uint32_t channel_id,
  * @return true on success
  */
 bool wican_stop_periodic_msg(wican_context_t *ctx, uint32_t channel_id, uint32_t msg_id);
+
+/* ============================================================================
+ * Robustness Functions
+ * ============================================================================ */
+
+/**
+ * @brief Connect with automatic retry and exponential backoff
+ * @param ctx Pointer to context structure  
+ * @param ip_address IP address (NULL for default/registry)
+ * @param port Port (0 for default/registry)
+ * @param max_retries Maximum retry attempts (0 = use default)
+ * @return true on success
+ */
+bool wican_connect_with_retry(wican_context_t *ctx, const char *ip_address, 
+                               uint16_t port, int max_retries);
+
+/**
+ * @brief Enable/disable automatic reconnection on connection loss
+ * @param ctx Pointer to context structure
+ * @param enable true to enable auto-reconnect
+ */
+void wican_set_auto_reconnect(wican_context_t *ctx, bool enable);
+
+/**
+ * @brief Attempt to reconnect after connection loss
+ * @param ctx Pointer to context structure
+ * @return true if reconnection successful
+ */
+bool wican_reconnect(wican_context_t *ctx);
+
+/**
+ * @brief Check connection health with heartbeat
+ * @param ctx Pointer to context structure
+ * @return true if connection is healthy
+ */
+bool wican_check_connection(wican_context_t *ctx);
+
+/**
+ * @brief Attempt to resync protocol after communication error
+ * @param ctx Pointer to context structure
+ * @return true if resync successful
+ */
+bool wican_resync(wican_context_t *ctx);
+
+/**
+ * @brief Get connection statistics
+ * @param ctx Pointer to context structure
+ * @param reconnect_count Pointer to receive reconnect count (optional)
+ * @param error_count Pointer to receive total error count (optional)
+ * @param resync_count Pointer to receive resync count (optional)
+ */
+void wican_get_stats(wican_context_t *ctx, uint32_t *reconnect_count,
+                     uint32_t *error_count, uint32_t *resync_count);
+
+/**
+ * @brief Enable debug logging to file
+ * @param ctx Pointer to context structure
+ * @param log_path Path to log file (NULL to disable)
+ * @return true on success
+ */
+bool wican_enable_logging(wican_context_t *ctx, const char *log_path);
+
+/**
+ * @brief Disable debug logging
+ * @param ctx Pointer to context structure
+ */
+void wican_disable_logging(wican_context_t *ctx);
+
+/**
+ * @brief Log a message (internal use, but exposed for J2534 layer)
+ * @param ctx Pointer to context structure
+ * @param format Printf-style format string
+ */
+void wican_log(wican_context_t *ctx, const char *format, ...);
 
 #ifdef __cplusplus
 }
