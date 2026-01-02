@@ -439,11 +439,36 @@ static void j2534_periodic_task(void *pvParameters)
                         can_frame.identifier &= 0x7FF;
                     }
 
-                    // Copy payload (skip first 4 bytes which are CAN ID)
+                    // Get payload (skip first 4 bytes which are CAN ID)
                     uint32_t payload_len = j2534_periodic_msgs[i].msg.data_size - 4;
                     if (payload_len > 8) payload_len = 8;
-                    can_frame.data_length_code = payload_len;
-                    memcpy(can_frame.data, &j2534_periodic_msgs[i].msg.data[4], payload_len);
+                    
+                    // Check if this is ISO15765 protocol - needs ISO-TP Single Frame format
+                    if (j2534_periodic_msgs[i].msg.protocol_id == J2534_PROTOCOL_ISO15765 ||
+                        j2534_periodic_msgs[i].msg.protocol_id == J2534_PROTOCOL_ISO15765_PS) {
+                        // ISO-TP Single Frame format: PCI byte (0x0N where N = data length) + data
+                        // The payload from J2534 is the UDS data (e.g., 3E 00 for TesterPresent)
+                        uint8_t uds_len = payload_len;
+                        if (uds_len <= 7) {  // Single frame can hold up to 7 bytes of data
+                            can_frame.data[0] = uds_len;  // PCI byte for Single Frame
+                            memcpy(&can_frame.data[1], &j2534_periodic_msgs[i].msg.data[4], uds_len);
+                            can_frame.data_length_code = 8;  // Always send 8 bytes (padded)
+                            // Pad remaining bytes with 0xCC or 0x00 per ISO15765
+                            if (j2534_periodic_msgs[i].msg.tx_flags & J2534_ISO15765_FRAME_PAD) {
+                                for (int p = 1 + uds_len; p < 8; p++) {
+                                    can_frame.data[p] = 0xCC;
+                                }
+                            }
+                        } else {
+                            // Data too long for single frame - just copy as-is for now
+                            can_frame.data_length_code = payload_len;
+                            memcpy(can_frame.data, &j2534_periodic_msgs[i].msg.data[4], payload_len);
+                        }
+                    } else {
+                        // Raw CAN - copy payload directly
+                        can_frame.data_length_code = payload_len;
+                        memcpy(can_frame.data, &j2534_periodic_msgs[i].msg.data[4], payload_len);
+                    }
 
                     twai_transmit(&can_frame, pdMS_TO_TICKS(10));
                     j2534_periodic_msgs[i].last_send_time = now;
