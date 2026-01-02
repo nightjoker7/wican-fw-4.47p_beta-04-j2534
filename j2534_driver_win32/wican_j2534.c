@@ -1009,20 +1009,35 @@ long __stdcall PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG *p
     j2534_channel_t *channel;
     periodic_msg_t *pmsg = NULL;
     int slot = -1;
-    char dbg[256];
+    char dbg[512];
     
     sprintf(dbg, "[J2534] PassThruStartPeriodicMsg: ChannelID=%lu Interval=%lu ms\n",
             ChannelID, TimeInterval);
     OutputDebugStringA(dbg);
+    log_msg("PassThruStartPeriodicMsg: ChannelID=%lu Interval=%lu ms", ChannelID, TimeInterval);
+    
+    if (pMsg) {
+        sprintf(dbg, "[J2534] PeriodicMsg: DataSize=%lu TxFlags=0x%lX data=",
+                pMsg->DataSize, pMsg->TxFlags);
+        OutputDebugStringA(dbg);
+        log_msg("  PeriodicMsg: DataSize=%lu TxFlags=0x%lX", pMsg->DataSize, pMsg->TxFlags);
+        for (unsigned long i = 0; i < pMsg->DataSize && i < 16; i++) {
+            sprintf(dbg, "%02X", pMsg->Data[i]);
+            OutputDebugStringA(dbg);
+        }
+        OutputDebugStringA("\n");
+    }
     
     if (!pMsg || !pMsgID) {
         set_error("Null parameter");
+        log_msg("PassThruStartPeriodicMsg: ERR_NULL_PARAMETER");
         return ERR_NULL_PARAMETER;
     }
     
     /* J2534 spec: TimeInterval must be between 5ms and 65535ms */
     if (TimeInterval < 5 || TimeInterval > 65535) {
         set_error("Invalid time interval");
+        log_msg("PassThruStartPeriodicMsg: ERR_INVALID_TIME_INTERVAL (%lu)", TimeInterval);
         return ERR_INVALID_TIME_INTERVAL;
     }
     
@@ -1085,10 +1100,13 @@ long __stdcall PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG *p
     
     /* Send to firmware */
     uint32_t fw_msg_id = 0;
+    log_msg("PassThruStartPeriodicMsg: Sending to firmware ch=%lu proto=%lu interval=%lu", 
+            channel->fw_channel_id, channel->protocol_id, TimeInterval);
     if (!wican_start_periodic_msg(&device->wican_ctx, channel->fw_channel_id,
-                                   &can_msg, TimeInterval, &fw_msg_id)) {
+                                   channel->protocol_id, &can_msg, TimeInterval, &fw_msg_id)) {
         LeaveCriticalSection(&g_cs_driver);
         set_error("Failed to start periodic message on firmware");
+        log_msg("PassThruStartPeriodicMsg: FAILED to start on firmware");
         return ERR_FAILED;
     }
     
@@ -1106,6 +1124,7 @@ long __stdcall PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG *p
     sprintf(dbg, "[J2534] PassThruStartPeriodicMsg: Started MsgID=%lu (firmware-side)\n",
             pmsg->msg_id);
     OutputDebugStringA(dbg);
+    log_msg("PassThruStartPeriodicMsg: SUCCESS MsgID=%lu", pmsg->msg_id);
     
     LeaveCriticalSection(&g_cs_driver);
     return STATUS_NOERROR;

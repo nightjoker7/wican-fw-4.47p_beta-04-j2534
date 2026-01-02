@@ -407,14 +407,15 @@ bool wican_ioctl(wican_context_t *ctx, uint32_t channel_id, uint32_t ioctl_id,
  * @brief Start a periodic message on the firmware
  * @param ctx Pointer to context structure
  * @param channel_id Channel ID from PassThruConnect
+ * @param protocol_id Protocol ID (CAN=5, ISO15765=6)
  * @param msg Message to send periodically
  * @param interval_ms Interval in milliseconds (5-65535)
  * @param msg_id Pointer to receive message ID from firmware
  * @return true on success
  */
 bool wican_start_periodic_msg(wican_context_t *ctx, uint32_t channel_id,
-                              const wican_can_msg_t *msg, uint32_t interval_ms,
-                              uint32_t *msg_id);
+                              uint32_t protocol_id, const wican_can_msg_t *msg, 
+                              uint32_t interval_ms, uint32_t *msg_id);
 
 /**
  * @brief Stop a periodic message on the firmware

@@ -1803,8 +1803,8 @@ bool wican_ioctl(wican_context_t *ctx, uint32_t channel_id, uint32_t ioctl_id,
 }
 
 bool wican_start_periodic_msg(wican_context_t *ctx, uint32_t channel_id, 
-                              const wican_can_msg_t *msg, uint32_t interval_ms,
-                              uint32_t *msg_id)
+                              uint32_t protocol_id, const wican_can_msg_t *msg, 
+                              uint32_t interval_ms, uint32_t *msg_id)
 {
     uint8_t data[128];
     uint8_t resp_data[16];
@@ -1813,8 +1813,8 @@ bool wican_start_periodic_msg(wican_context_t *ctx, uint32_t channel_id,
     uint16_t offset = 0;
     
     char dbg[256];
-    sprintf(dbg, "[WICAN] wican_start_periodic_msg: ch=%lu interval=%lu ms CAN_ID=0x%08lX\n",
-            channel_id, interval_ms, msg ? msg->can_id : 0);
+    sprintf(dbg, "[WICAN] wican_start_periodic_msg: ch=%lu proto=%lu interval=%lu ms CAN_ID=0x%08lX\n",
+            channel_id, protocol_id, interval_ms, msg ? msg->can_id : 0);
     OutputDebugStringA(dbg);
     printf("%s", dbg);
     
@@ -1836,8 +1836,7 @@ bool wican_start_periodic_msg(wican_context_t *ctx, uint32_t channel_id,
     data[offset++] = (interval_ms >> 8) & 0xFF;
     data[offset++] = interval_ms & 0xFF;
     
-    /* Protocol ID (CAN=5, ISO15765=6) */
-    uint32_t protocol_id = 6;  /* Default to ISO15765 for TesterPresent */
+    /* Protocol ID (CAN=5, ISO15765=6) - use provided protocol */
     data[offset++] = (protocol_id >> 24) & 0xFF;
     data[offset++] = (protocol_id >> 16) & 0xFF;
     data[offset++] = (protocol_id >> 8) & 0xFF;
