@@ -133,8 +133,8 @@ j2534_error_t j2534_read_msgs(uint32_t channel_id, j2534_msg_t *msgs,
             read_count++;
         }
         
-        // Static buffer for USDT reassembly (J1850 only)
-        static uint8_t usdt_complete_msg[4096 + 3];  // Max USDT buffer + header
+        // Static buffer for USDT reassembly (J1850 only) - sized for GM programming
+        static uint8_t usdt_complete_msg[4500 + 3];  // Max USDT buffer + header
         
         while (read_count < requested) {
             stn_j2534_msg_t stn_msgs[8];
@@ -567,7 +567,7 @@ j2534_error_t j2534_write_msgs(uint32_t channel_id, j2534_msg_t *msgs,
                             
                             if (frame_type == USDT_FRAME_FF || frame_type == USDT_FRAME_CF) {
                                 // Multi-frame response - process via USDT
-                                static uint8_t complete_msg[4096];
+                                static uint8_t complete_msg[4500];
                                 uint32_t complete_len = 0;
                                 
                                 bool complete = usdt_process_rx_frame(

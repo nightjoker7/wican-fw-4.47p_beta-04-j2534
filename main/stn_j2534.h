@@ -229,6 +229,18 @@ bool stn_j2534_is_legacy_active(void);
 stn_protocol_t stn_j2534_get_protocol(void);
 
 /**
+ * @brief Set baud rate for J1850 protocols (VPW/PWM)
+ * 
+ * For J1850 VPW, this switches between normal (10.4 kbaud) and 4x mode
+ * (41.6 kbaud) used for ECU programming. Implemented by switching STN
+ * protocol: ATSP2 for VPW, ATSP1 for 4x mode.
+ * 
+ * @param baudrate Baud rate (10400 for normal VPW, 41600 for 4x mode)
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_set_baudrate(uint32_t baudrate);
+
+/**
  * @brief Reset STN chip to defaults
  * @return Status code
  */

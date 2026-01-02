@@ -1324,14 +1324,23 @@ bool wican_write_messages(wican_context_t *ctx, uint32_t channel_id, uint32_t pr
             return false;
         }
         
-        /* CRITICAL: For ISO-TP multi-frame messages, the firmware must drain the TX queue
-         * before responding. At 500kbps, a 4KB message (585 frames) takes ~175ms to transmit.
-         * Use a minimum wait time to allow the firmware to complete TX drain.
-         * J2534 timeout of 0 means "no timeout" but we still need to wait for firmware.
+        /* Timeout handling for firmware response:
+         * - For legacy protocols (J1850, ISO9141, ISO14230): Use shorter timeout (max 3s)
+         *   These protocols are slower but messages are small
+         * - For CAN ISO-TP multi-frame: Use longer timeout for large messages
+         *   At 500kbps, a 4KB message (585 frames) takes ~175ms to transmit
          */
         uint32_t wait_timeout = timeout_ms;
-        if (wait_timeout < 6000) {
-            wait_timeout = 6000;  /* Minimum 6 seconds for large ISO-TP TX to complete */
+        if (is_legacy_msg) {
+            /* Legacy protocols: cap timeout at 3 seconds */
+            if (wait_timeout == 0 || wait_timeout > 3000) {
+                wait_timeout = 3000;
+            }
+        } else {
+            /* CAN protocols: minimum 4 seconds for large ISO-TP TX */
+            if (wait_timeout < 4000) {
+                wait_timeout = 4000;
+            }
         }
         
         if (!wican_receive_response(ctx, &resp_cmd, &resp_status, resp_data, &resp_len, wait_timeout)) {

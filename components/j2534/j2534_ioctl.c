@@ -134,9 +134,20 @@ j2534_error_t j2534_ioctl(uint32_t channel_id, uint32_t ioctl_id,
                     switch (list->config_ptr[i].parameter) {
                         case J2534_CONFIG_DATA_RATE:
                             ch->baudrate = list->config_ptr[i].value;
-                            can_disable();
-                            can_set_bitrate(j2534_baudrate_to_can(ch->baudrate));
-                            can_enable();
+                            ESP_LOGI(TAG, "SET_CONFIG: DATA_RATE=%lu for protocol 0x%lX", 
+                                     ch->baudrate, ch->protocol_id);
+#if HARDWARE_VER == WICAN_PRO
+                            // For legacy protocols (J1850, ISO9141, etc.), use STN chip
+                            if (j2534_is_legacy_protocol(ch->protocol_id)) {
+                                stn_j2534_set_baudrate(ch->baudrate);
+                            } else 
+#endif
+                            {
+                                // For CAN protocols, use hardware CAN controller
+                                can_disable();
+                                can_set_bitrate(j2534_baudrate_to_can(ch->baudrate));
+                                can_enable();
+                            }
                             break;
                         case J2534_CONFIG_LOOPBACK:
                             ch->loopback = list->config_ptr[i].value ? true : false;

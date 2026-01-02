@@ -1,10 +1,8 @@
 # J2534 Component CMakeLists.txt
 # SAE J2534 Pass-Thru Protocol Implementation for WiCAN
 #
-# NOTE: This component needs access to main component headers (can.h, stn_j2534.h, hw_config.h)
-# but we cannot use PRIV_REQUIRES main due to circular dependency (main requires j2534).
-# Instead, we add main's include directory directly via PRIV_INCLUDE_DIRS.
-# The actual linking works because main provides the symbols and both link into the final ELF.
+# NOTE: stn_j2534 implementation is in main/stn_j2534.c (not refactored yet)
+# The stn_j2534_*.c files in this component are incomplete and not used.
 
 idf_component_register(
     SRCS

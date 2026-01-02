@@ -82,9 +82,9 @@ idf_component_register(
         "usb_host.cpp"
         "ftp.c"
         "elm327.c"
-        "stn_j2534.c"
         "obd.c"
         "wusb3801.c"
+        "stn_j2534.c"
         "${srcs}"
         INCLUDE_DIRS "." 
         INCLUDE_DIRS        # Public include directories

@@ -78,6 +78,7 @@
 #include "vpn_manager.h"
 #include "config_mode.h"
 #include "j2534.h"
+#include "stn_j2534.h"
 #include "driver/rtc_io.h"
 
 #define TAG 		__func__
@@ -888,6 +889,10 @@ void app_main(void)
 	// Always initialize J2534 module so it works regardless of configured protocol
 	// J2534 DLL can connect via TCP even when device is configured for other protocols
 	j2534_init(&send_to_host, NULL);
+	
+	// Register callback for legacy protocol cleanup (J1850, ISO9141, etc.)
+	// This allows j2534 component to call stn_j2534_deinit without circular dependency
+	j2534_register_legacy_deinit_callback(stn_j2534_deinit_callback);
 
 	wifi_mode_t wifi_mode = config_server_get_wifi_mode();
 

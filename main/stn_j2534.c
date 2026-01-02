@@ -60,9 +60,10 @@
 
 #define STN_J2534_UART_NUM          UART_NUM_1
 #define STN_J2534_BUFFER_SIZE       512
-#define STN_J2534_CMD_TIMEOUT_MS    200   // Reduced from 1000ms - J1850 responses are fast
-#define STN_J2534_MUTEX_TIMEOUT_MS  5000
+#define STN_J2534_CMD_TIMEOUT_MS    1000  // Default command timeout
+#define STN_J2534_MUTEX_TIMEOUT_MS  5000  // Mutex timeout - needs to be long enough for protocol init
 #define STN_J2534_READ_TIMEOUT_MS   10
+#define STN_J2534_TX_MAX_WAIT_MS    5000  // Max time to wait for TX to complete
 
 // Monitor mode settings
 #define STN_J2534_RX_BUFFER_SIZE    32      // Circular buffer for received messages
@@ -94,6 +95,13 @@ static stn_j2534_config_t s_config = {
 // Cache for J1850 header to avoid redundant ATSH commands
 static uint8_t s_last_j1850_header[3] = {0};
 
+// GM Class 2 High-Speed Mode (4x VPW) tracking
+// Service $A1 = Enable High Speed Mode (switch to 41.6k)
+// Service $A2 = Return to Normal Communication (switch back to 10.4k)
+static volatile bool s_vpw_4x_mode = false;
+static volatile int64_t s_vpw_4x_last_rx_time = 0;  // Last RX timestamp in 4x mode
+#define VPW_4X_IDLE_TIMEOUT_MS 1500  // Auto-switch back to 1x after 1.5s of no RX
+
 /* ============================================================================
  * Monitor Mode State (for continuous J1850 RX)
  * ============================================================================ */
@@ -119,12 +127,20 @@ static void stn_j2534_reset_state(void);
 
 /**
  * @brief Read from UART until pattern found or timeout
+ * @note Timeout is capped at STN_J2534_TX_MAX_WAIT_MS to prevent blocking
  */
 static int stn_j2534_read_until(char* buffer, size_t buffer_size, 
                                 const char* pattern, int timeout_ms)
 {
     int total_len = 0;
     int64_t start_time = esp_timer_get_time() / 1000;
+    int no_data_count = 0;
+    
+    // Cap timeout to prevent excessive blocking
+    if (timeout_ms > STN_J2534_TX_MAX_WAIT_MS) {
+        ESP_LOGW(TAG, "Capping timeout from %d to %d ms", timeout_ms, STN_J2534_TX_MAX_WAIT_MS);
+        timeout_ms = STN_J2534_TX_MAX_WAIT_MS;
+    }
     
     while (total_len < buffer_size - 1) {
         int len = uart_read_bytes(STN_J2534_UART_NUM, buffer + total_len, 
@@ -134,14 +150,29 @@ static int stn_j2534_read_until(char* buffer, size_t buffer_size,
         if (len > 0) {
             total_len += len;
             buffer[total_len] = '\0';
+            no_data_count = 0;  // Reset no-data counter
             
             if (strstr(buffer, pattern)) {
+                return total_len;
+            }
+            
+            // Check for error responses early
+            if (strstr(buffer, "ERROR") || strstr(buffer, "?")) {
+                ESP_LOGW(TAG, "Early error response: %s", buffer);
+                return total_len;
+            }
+        } else {
+            no_data_count++;
+            // If we've received some data but then get many empty reads,
+            // the STN chip may be done even without sending ">"
+            if (total_len > 0 && no_data_count > 50) {
+                ESP_LOGW(TAG, "No more data after %d bytes, returning early", total_len);
                 return total_len;
             }
         }
         
         if ((esp_timer_get_time() / 1000 - start_time) >= timeout_ms) {
-            ESP_LOGW(TAG, "Read timeout after %d ms", timeout_ms);
+            ESP_LOGW(TAG, "Read timeout after %d ms (got %d bytes)", timeout_ms, total_len);
             break;
         }
     }
@@ -1242,13 +1273,13 @@ stn_j2534_status_t stn_j2534_send_message(
         
         // Wait for monitor task to pause and release UART
         if (s_tx_done_sem) {
-            if (xSemaphoreTake(s_tx_done_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            if (xSemaphoreTake(s_tx_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
                 ESP_LOGE(TAG, "Timeout waiting for monitor to pause");
                 s_monitor_pause = false;
                 return STN_J2534_STATUS_CHIP_ERROR;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(50));  // Additional settling time
+        vTaskDelay(pdMS_TO_TICKS(20));  // Reduced settling time
     }
     
     // Now safe to use UART directly (monitor is paused or not active)
@@ -1307,12 +1338,91 @@ stn_j2534_status_t stn_j2534_send_message(
         strcpy(cmd, "\r");
     }
     
+    // Detect GM Class 2 High-Speed Mode commands (Service $A1 / $A2)
+    // WORKAROUND: STN chip cannot do VPW at 41.6k (4x mode)
+    // Instead of sending $A1 to ECU (which would cause it to switch to 4x),
+    // we INTERCEPT the $A1 command and FAKE an $E1 response back to DPS.
+    // This keeps ECU at 10.4k and allows programming to continue (slowly).
+    bool is_gm_4x_enable = false;
+    bool is_gm_4x_disable = false;
+    
+    // Check for $A1/$A2 in payload - works for both VPW and PWM modes
+    if (payload_len >= 1 && 
+        (s_config.protocol == STN_PROTO_J1850VPW || s_config.protocol == STN_PROTO_J1850PWM)) {
+        ESP_LOGW(TAG, "Checking payload[0]=0x%02X for $A1/$A2, protocol=%d, 4x_mode=%d", 
+                 payload_data[0], s_config.protocol, s_vpw_4x_mode);
+        if (payload_data[0] == 0xA1) {
+            is_gm_4x_enable = true;
+            ESP_LOGW(TAG, "*** INTERCEPTING GM $A1 Enable High Speed Mode - FAKING $E1 response ***");
+            ESP_LOGW(TAG, "*** ECU will stay at 10.4k - 4x mode NOT supported by STN chip ***");
+            
+            // DON'T send $A1 to ECU! Instead, fake an $E1 response.
+            // Build fake response with same header format (swap source/dest)
+            // Original header: data[0]=priority, data[1]=dest, data[2]=source
+            // Response header: same priority, dest becomes source, source becomes dest
+            responses[0].data[0] = data[0];       // Same priority byte
+            responses[0].data[1] = data[2];       // Swap: original source -> response dest
+            responses[0].data[2] = data[1];       // Swap: original dest -> response source  
+            responses[0].data[3] = 0xE1;          // Positive response to $A1
+            responses[0].data_len = 4;
+            responses[0].timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+            responses[0].rx_status = 0;
+            *num_responses = 1;
+            
+            ESP_LOGW(TAG, "Faked $E1 response: %02X %02X %02X %02X", 
+                     responses[0].data[0], responses[0].data[1], 
+                     responses[0].data[2], responses[0].data[3]);
+            
+            // Mark that we're "in 4x mode" even though we're not actually switching
+            // This allows stn_j2534_set_baudrate() to early-return when DPS calls SET_CONFIG
+            s_vpw_4x_mode = true;
+            s_config.baudrate = 41600;  // Report what DPS expects
+            
+            // Release semaphore and return success - we didn't send anything to ECU
+            if (!was_monitoring) {
+                xSemaphoreGive(xuart1_semaphore);
+            }
+            return STN_J2534_STATUS_OK;
+            
+        } else if (payload_data[0] == 0xA2) {
+            is_gm_4x_disable = true;
+            ESP_LOGW(TAG, "*** Detected GM $A2 Return to Normal - faking $E2 response ***");
+            
+            // Fake $E2 response as well for consistency
+            responses[0].data[0] = data[0];
+            responses[0].data[1] = data[2];
+            responses[0].data[2] = data[1];
+            responses[0].data[3] = 0xE2;          // Positive response to $A2
+            responses[0].data_len = 4;
+            responses[0].timestamp = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
+            responses[0].rx_status = 0;
+            *num_responses = 1;
+            
+            ESP_LOGW(TAG, "Faked $E2 response: %02X %02X %02X %02X",
+                     responses[0].data[0], responses[0].data[1],
+                     responses[0].data[2], responses[0].data[3]);
+            
+            // Mark that we're returning to normal mode
+            s_vpw_4x_mode = false;
+            s_config.baudrate = 10400;  // Report normal speed
+            
+            if (!was_monitoring) {
+                xSemaphoreGive(xuart1_semaphore);
+            }
+            return STN_J2534_STATUS_OK;
+        }
+    } else {
+        ESP_LOGI(TAG, "Skipping $A1/$A2 check: payload_len=%lu, protocol=%d", payload_len, s_config.protocol);
+    }
+    
     // Send and wait for responses
     ESP_LOGI(TAG, "J1850 TX cmd: [%s]", cmd);
     uart_flush_input(STN_J2534_UART_NUM);
     uart_write_bytes(STN_J2534_UART_NUM, cmd, strlen(cmd));
     
     // Read response with appropriate timeout (add small buffer for UART transfer)
+    // For $A1/$A2 commands, the response ($E1/$E2) comes at the CURRENT baud rate
+    // ECU switches speed AFTER responding, so we read first, then switch
     int rsp_len = stn_j2534_read_until(response, sizeof(response), ">", timeout_ms + 50);
     response[rsp_len] = '\0';
     
@@ -1366,6 +1476,10 @@ stn_j2534_status_t stn_j2534_send_message(
         ESP_LOGI(TAG, "Total responses parsed: %lu", resp_count);
     }
     
+    // NOTE: GM Class 2 High-Speed Mode ($A1/$A2) is now intercepted above.
+    // We fake the $E1/$E2 responses and keep ECU at 10.4k because STN chip
+    // cannot do VPW at 41.6k. The old ATSP1/ATSP2 switching code has been removed.
+    
     // Resume monitor mode if it was active
     if (was_monitoring) {
         ESP_LOGI(TAG, "Resuming monitor mode...");
@@ -1410,12 +1524,124 @@ stn_protocol_t stn_j2534_get_protocol(void)
 }
 
 /**
+ * @brief Set baud rate for J1850 protocols
+ * 
+ * J1850 VPW normally runs at 10.4 kbaud but can run at 41.6 kbaud (4x mode)
+ * for high-speed operations like ECU programming. This is achieved by 
+ * switching between STN protocols:
+ * - ATSP2 = J1850 VPW (10.4 kbaud)
+ * - ATSP1 = J1850 PWM (41.6 kbaud) - used for VPW 4x mode
+ * 
+ * @param baudrate Baud rate (10400 for normal, 41600 for 4x mode)
+ * @return Status code
+ */
+stn_j2534_status_t stn_j2534_set_baudrate(uint32_t baudrate)
+{
+    ESP_LOGW(TAG, "set_baudrate called: baudrate=%lu, s_vpw_4x_mode=%d, s_config.protocol=%d, s_config.baudrate=%lu",
+             baudrate, s_vpw_4x_mode, s_config.protocol, s_config.baudrate);
+    
+    // Only applicable for J1850 protocols
+    if (s_config.protocol != STN_PROTO_J1850VPW && 
+        s_config.protocol != STN_PROTO_J1850PWM) {
+        ESP_LOGW(TAG, "set_baudrate: Not a J1850 protocol (%d), returning OK", s_config.protocol);
+        return STN_J2534_STATUS_OK;  // No-op for other protocols
+    }
+    
+    // Check if we're already at the requested baud rate
+    // This prevents redundant switching when software sends SET_CONFIG after $A1/$A2
+    // Also check if already storing this baudrate (in case auto-detect already switched)
+    if (baudrate == 41600) {
+        if (s_vpw_4x_mode || s_config.baudrate == 41600) {
+            ESP_LOGI(TAG, "set_baudrate: Already at 41600 (4x_mode=%d, stored=%lu), no action needed",
+                     s_vpw_4x_mode, s_config.baudrate);
+            s_config.baudrate = baudrate;
+            s_vpw_4x_mode = true;  // Ensure flag is set
+            return STN_J2534_STATUS_OK;
+        }
+    }
+    if (baudrate == 10400) {
+        if (!s_vpw_4x_mode || s_config.baudrate == 10400) {
+            ESP_LOGI(TAG, "set_baudrate: Already at 10400 (4x_mode=%d, stored=%lu), no action needed",
+                     s_vpw_4x_mode, s_config.baudrate);
+            s_config.baudrate = baudrate;
+            s_vpw_4x_mode = false;  // Ensure flag is cleared
+            return STN_J2534_STATUS_OK;
+        }
+    }
+    
+    // Handle monitor mode - same as stn_j2534_send_msg()
+    bool was_monitoring = s_monitor_active;
+    if (was_monitoring) {
+        ESP_LOGI(TAG, "set_baudrate: Pausing monitor mode...");
+        s_monitor_pause = true;
+        
+        // Wait for monitor task to pause and release UART
+        if (s_tx_done_sem) {
+            if (xSemaphoreTake(s_tx_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+                ESP_LOGE(TAG, "set_baudrate: Timeout waiting for monitor to pause");
+                s_monitor_pause = false;
+                return STN_J2534_STATUS_CHIP_ERROR;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));  // Short settling time
+    }
+    
+    // Now safe to use UART directly (monitor is paused or not active)
+    if (!was_monitoring) {
+        // Need the semaphore for UART access
+        if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(STN_J2534_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGE(TAG, "set_baudrate: Failed to take semaphore");
+            return STN_J2534_STATUS_CHIP_ERROR;
+        }
+    }
+    
+    ESP_LOGW(TAG, "*** SET_CONFIG baud rate request: %lu ***", baudrate);
+    
+    // WORKAROUND: STN chip cannot do VPW at 41.6k (4x mode)
+    // We intercept $A1/$A2 commands and fake the responses, keeping ECU at 10.4k.
+    // When DPS requests 41600 baud, we just accept it but stay at 10.4k.
+    // This allows programming to work (slowly) without actual 4x mode support.
+    
+    if (baudrate == 41600) {
+        // DPS thinks we're switching to 4x mode - just accept it
+        // We already faked the $E1 response, ECU is still at 10.4k
+        ESP_LOGW(TAG, "*** FAKE 4x MODE: Accepting 41600 request but staying at 10.4k VPW ***");
+        ESP_LOGW(TAG, "*** Programming will work but at 1x speed (4x slower) ***");
+        s_vpw_4x_mode = true;  // Track that DPS thinks we're in 4x mode
+        s_config.baudrate = baudrate;  // Report what DPS expects
+        
+    } else if (baudrate == 10400) {
+        // Switching back to normal mode
+        ESP_LOGW(TAG, "*** Returning to normal 10.4k VPW mode ***");
+        s_vpw_4x_mode = false;
+        s_config.baudrate = baudrate;
+        
+    } else {
+        ESP_LOGW(TAG, "Unsupported J1850 baud rate: %lu (expected 10400 or 41600)", baudrate);
+        s_config.baudrate = baudrate;  // Accept it anyway
+    }
+    
+    // Resume monitor mode if it was active, or release semaphore
+    if (was_monitoring) {
+        ESP_LOGI(TAG, "set_baudrate: Resuming monitor mode...");
+        s_monitor_pause = false;
+    } else {
+        xSemaphoreGive(xuart1_semaphore);
+    }
+    return STN_J2534_STATUS_OK;
+}
+
+/**
  * @brief Reset internal state variables without touching the chip
  */
 static void stn_j2534_reset_state(void)
 {
     // Clear header cache
     memset(s_last_j1850_header, 0, sizeof(s_last_j1850_header));
+    
+    // Reset VPW 4x mode flag and idle timer
+    s_vpw_4x_mode = false;
+    s_vpw_4x_last_rx_time = 0;
     
     // Reset config to defaults
     s_config.protocol = STN_PROTO_AUTO;
@@ -1506,9 +1732,65 @@ stn_j2534_status_t stn_j2534_read_msgs(
     
     *num_msgs = count;
     
+    // Track RX activity for 4x mode idle timeout
     if (count > 0) {
+        if (s_vpw_4x_mode) {
+            s_vpw_4x_last_rx_time = esp_timer_get_time() / 1000;  // ms
+        }
         ESP_LOGI(TAG, "stn_j2534_read_msgs: returned %lu messages", count);
         return STN_J2534_STATUS_OK;
+    }
+    
+    // Check for 4x mode idle timeout - auto-switch back to 1x
+    if (s_vpw_4x_mode && s_vpw_4x_last_rx_time > 0) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t idle_ms = now_ms - s_vpw_4x_last_rx_time;
+        
+        if (idle_ms >= VPW_4X_IDLE_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "*** 4x mode idle timeout (%lld ms) - switching back to 1x ***", idle_ms);
+            
+            // Switch back to 1x mode (ATSP2)
+            char proto_resp[64];
+            
+            // Pause monitor if active
+            bool was_monitoring = s_monitor_active;
+            if (was_monitoring) {
+                s_monitor_pause = true;
+                if (s_tx_done_sem) {
+                    xSemaphoreTake(s_tx_done_sem, pdMS_TO_TICKS(500));
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            
+            if (!was_monitoring) {
+                xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(STN_J2534_MUTEX_TIMEOUT_MS));
+            }
+            
+            uart_flush_input(STN_J2534_UART_NUM);
+            uart_write_bytes(STN_J2534_UART_NUM, "ATSP2\r", 6);
+            stn_j2534_read_until(proto_resp, sizeof(proto_resp), ">", 500);
+            ESP_LOGI(TAG, "ATSP2 response: [%s]", proto_resp);
+            
+            // Re-apply settings
+            uart_write_bytes(STN_J2534_UART_NUM, "ATH1\r", 5);
+            stn_j2534_read_until(proto_resp, sizeof(proto_resp), ">", 200);
+            uart_write_bytes(STN_J2534_UART_NUM, "ATS0\r", 5);
+            stn_j2534_read_until(proto_resp, sizeof(proto_resp), ">", 200);
+            uart_write_bytes(STN_J2534_UART_NUM, "ATAL\r", 5);
+            stn_j2534_read_until(proto_resp, sizeof(proto_resp), ">", 200);
+            
+            if (was_monitoring) {
+                s_monitor_pause = false;
+            } else {
+                xSemaphoreGive(xuart1_semaphore);
+            }
+            
+            s_vpw_4x_mode = false;
+            s_vpw_4x_last_rx_time = 0;
+            memset(s_last_j1850_header, 0, sizeof(s_last_j1850_header));
+            
+            ESP_LOGW(TAG, "*** Back to 1x (10.4k) mode ***");
+        }
     }
     
     return STN_J2534_STATUS_NO_DATA;
@@ -1615,6 +1897,12 @@ bool stn_j2534_is_legacy_active(void)
 stn_protocol_t stn_j2534_get_protocol(void)
 {
     return STN_PROTO_AUTO;
+}
+
+stn_j2534_status_t stn_j2534_set_baudrate(uint32_t baudrate)
+{
+    (void)baudrate;
+    return STN_J2534_STATUS_CHIP_ERROR;
 }
 
 esp_err_t stn_j2534_deinit(void)

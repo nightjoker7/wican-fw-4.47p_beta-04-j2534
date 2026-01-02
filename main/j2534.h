@@ -528,6 +528,29 @@ uint32_t j2534_get_protocol(void);
  */
 void j2534_reset(void);
 
+/* ============================================================================
+ * Callback Registration for Legacy Protocol Support
+ *
+ * These callbacks allow the main component to register functions that the
+ * J2534 component can call for legacy protocol (J1850, ISO9141, etc.) support.
+ * This avoids circular dependencies between j2534 and main components.
+ * ============================================================================ */
+
+/**
+ * @brief Callback type for legacy protocol deinit
+ *
+ * This callback is called when a legacy protocol channel is disconnected
+ * or when connection fails, to clean up STN chip state and re-enable
+ * the elm327_read_task.
+ */
+typedef void (*j2534_legacy_deinit_callback_t)(void);
+
+/**
+ * @brief Register callback for legacy protocol deinitialization
+ * @param callback Function to call when legacy protocol needs cleanup
+ */
+void j2534_register_legacy_deinit_callback(j2534_legacy_deinit_callback_t callback);
+
 #ifdef __cplusplus
 }
 #endif
