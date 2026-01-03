@@ -305,6 +305,43 @@ static j2534_channel_t* get_channel(unsigned long channel_id, j2534_device_t **o
 }
 
 /**
+ * Check if a CAN message contains UDS Response Pending (7F xx 78)
+ * 
+ * In UDS (ISO 14229), when an ECU needs more time to process a request,
+ * it sends a Negative Response with NRC 0x78 (requestCorrectlyReceived-ResponsePending).
+ * Per UDS spec, the tester should continue waiting for the actual response.
+ * 
+ * Message format for ISO15765: [CAN_ID(4)] [UDS_DATA]
+ * UDS Response Pending: 7F [service_id] 78
+ * 
+ * @param msg The received message from firmware
+ * @param service_id Output: the original service ID that is pending (optional)
+ * @return true if this is a Response Pending message
+ */
+static bool is_uds_response_pending(wican_can_msg_t *msg, uint8_t *service_id)
+{
+    /* Response Pending is always 3 bytes: 7F [SID] 78 */
+    if (msg->data_len < 3) {
+        return false;
+    }
+    
+    /* Check for 7F xx 78 pattern */
+    if (msg->data[0] == 0x7F && msg->data[2] == 0x78) {
+        if (service_id) {
+            *service_id = msg->data[1];
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+/* Maximum time to wait for final response after receiving Response Pending (30 seconds)
+ * BCM erase operations can take several seconds, and we may receive multiple 7F xx 78 responses.
+ * P2* extended timing per ISO 14229: up to 5000ms per Response Pending, but ECU may send multiple. */
+#define UDS_RESPONSE_PENDING_MAX_WAIT_MS  30000
+
+/**
  * Flush the write buffer for a channel
  * 
  * Sends all buffered messages as a batch to minimize TCP round-trips.
@@ -700,6 +737,10 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     j2534_channel_t *channel;
     wican_can_msg_t can_msgs[32];
     uint32_t num_msgs;
+    DWORD start_time = GetTickCount();
+    DWORD total_elapsed = 0;
+    bool got_response_pending = false;
+    uint8_t pending_service_id = 0;
     
     log_msg("PassThruReadMsgs: ChannelID=%lu NumMsgs=%lu Timeout=%lu", 
             ChannelID, pNumMsgs ? *pNumMsgs : 0, Timeout);
@@ -752,12 +793,71 @@ long __stdcall PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg,
     
     uint32_t max_msgs = (*pNumMsgs > 32) ? 32 : *pNumMsgs;
     
+    /**
+     * UDS Response Pending (7F xx 78) Handling Loop
+     * 
+     * When an ECU needs more time to process a request (e.g., flash erase/program),
+     * it sends 7F [service_id] 78 ("requestCorrectlyReceived-ResponsePending").
+     * Per ISO 14229 (UDS), the tester must NOT treat this as an error - instead,
+     * it should keep waiting for the actual positive (xx+0x40) or negative response.
+     * 
+     * GM BCM programming triggers this during erase operations, which can take
+     * several seconds. The ECU sends multiple 7F 36 78 responses before finally
+     * sending 76 (positive TransferData response).
+     */
+read_again:
     if (!wican_read_messages(&device->wican_ctx, channel->fw_channel_id, can_msgs, 
                              max_msgs, &num_msgs, Timeout)) {
         *pNumMsgs = 0;
         LeaveCriticalSection(&g_cs_driver);
         log_msg("PassThruReadMsgs: BUFFER_EMPTY (timeout=%lu)", Timeout);
         return ERR_BUFFER_EMPTY;
+    }
+    
+    /* Check for Response Pending in received messages */
+    for (uint32_t i = 0; i < num_msgs; i++) {
+        /* Only check non-TX-echo messages (RxStatus bit 0 = TX_MSG_TYPE) */
+        if ((can_msgs[i].rx_status & 0x01) == 0 && !(can_msgs[i].flags & 0x80)) {
+            uint8_t sid = 0;
+            if (is_uds_response_pending(&can_msgs[i], &sid)) {
+                got_response_pending = true;
+                pending_service_id = sid;
+                
+                total_elapsed = GetTickCount() - start_time;
+                
+                char dbg[256];
+                sprintf(dbg, "[J2534] Response Pending (7F %02X 78) received from 0x%lX, elapsed=%lu ms, continuing to wait...\n",
+                        sid, can_msgs[i].can_id, total_elapsed);
+                OutputDebugStringA(dbg);
+                log_msg("PassThruReadMsgs: Response Pending (7F %02X 78) from 0x%lX, elapsed=%lu ms",
+                        sid, can_msgs[i].can_id, total_elapsed);
+                
+                /* Check if we've exceeded maximum wait time */
+                if (total_elapsed >= UDS_RESPONSE_PENDING_MAX_WAIT_MS) {
+                    OutputDebugStringA("[J2534] Response Pending: Max wait time exceeded, returning timeout\n");
+                    log_msg("PassThruReadMsgs: Response Pending max wait exceeded after %lu ms", total_elapsed);
+                    *pNumMsgs = 0;
+                    LeaveCriticalSection(&g_cs_driver);
+                    return ERR_BUFFER_EMPTY;
+                }
+                
+                /* Continue reading - ECU is still processing */
+                goto read_again;
+            }
+        }
+    }
+    
+    /* If we got here after Response Pending, log the final response */
+    if (got_response_pending && num_msgs > 0) {
+        total_elapsed = GetTickCount() - start_time;
+        char dbg[256];
+        sprintf(dbg, "[J2534] Final response received after Response Pending, total wait=%lu ms, data=%02X%02X%02X\n",
+                total_elapsed, can_msgs[0].data[0], can_msgs[0].data[1], 
+                can_msgs[0].data_len > 2 ? can_msgs[0].data[2] : 0);
+        OutputDebugStringA(dbg);
+        log_msg("PassThruReadMsgs: Final response after %lu ms: %02X%02X%02X...",
+                total_elapsed, can_msgs[0].data[0], can_msgs[0].data[1],
+                can_msgs[0].data_len > 2 ? can_msgs[0].data[2] : 0);
     }
     
     for (uint32_t i = 0; i < num_msgs; i++) {
